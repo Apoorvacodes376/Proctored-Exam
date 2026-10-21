@@ -1,0 +1,22 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --accent: #16a34a;
+    --accent-light: #bbf7d0;
+  }
+
+  .theme-faculty {
+    --accent: #d97706;
+    --accent-light: #fde68a;
+  }
+
+  * {
+    box-sizing: border-box;
+  }
+
+  body {
+    margin: 0;
+    font-family: system-ui, -apple-system, sans-serif;
+  }
+}
