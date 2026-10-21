@@ -1,5 +1,5 @@
 import { NavLink, useNavigate } from 'react-router-dom'
-import { LayoutDashboard, Users, FileText, LogOut, ShieldCheck } from 'lucide-react'
+import { LayoutDashboard, Users, FileText, LogOut, ShieldCheck, Radio, ClipboardList, FlaskConical } from 'lucide-react'
 import { useAuth } from '../context/AuthContext'
 import ThemeToggle from './ThemeToggle'
 
@@ -7,6 +7,9 @@ const navItems = [
   { to: '/faculty',           icon: LayoutDashboard, label: 'Dashboard', end: true },
   { to: '/faculty/students',  icon: Users,           label: 'Students' },
   { to: '/faculty/exams',     icon: FileText,        label: 'Exams' },
+  { to: '/faculty/monitor',   icon: Radio,           label: 'Live Monitor' },
+  { to: '/faculty/review',    icon: ClipboardList,   label: 'Review' },
+  { to: '/faculty/evaluation', icon: FlaskConical,  label: 'Evaluation' },
 ]
 
 export default function FacultyLayout({ children }) {

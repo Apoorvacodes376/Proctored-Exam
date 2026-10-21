@@ -1,24 +1,33 @@
 import { useState, useEffect, useRef } from 'react'
 import { Clock } from 'lucide-react'
 
+/** Whole seconds remaining, rounded up so the student is never cut short. */
+export const secondsLeft = (endsAt, now = Date.now()) => Math.max(0, Math.ceil((endsAt - now) / 1000))
+
+// Ticks on a wall-clock interval. (The previous version re-armed a
+// timeout only when the displayed second changed; a tick that landed in
+// the same second set identical state, React skipped the re-render, and
+// the countdown — and automatic submission — stalled until something else
+// re-rendered the page.)
 export default function ExamTimer({ endsAt, onExpire }) {
-  const [secsLeft, setSecsLeft] = useState(() =>
-    Math.max(0, Math.floor((endsAt - Date.now()) / 1000))
-  )
+  const [secsLeft, setSecsLeft] = useState(() => secondsLeft(endsAt))
   const firedRef = useRef(false)
+  const onExpireRef = useRef(onExpire)
+  useEffect(() => { onExpireRef.current = onExpire }, [onExpire])
 
   useEffect(() => {
-    if (secsLeft <= 0) {
-      if (!firedRef.current) { firedRef.current = true; onExpire() }
-      return
-    }
-    const id = setTimeout(() => {
-      const next = Math.max(0, Math.floor((endsAt - Date.now()) / 1000))
+    function tick() {
+      const next = secondsLeft(endsAt)
       setSecsLeft(next)
-      if (next <= 0 && !firedRef.current) { firedRef.current = true; onExpire() }
-    }, 500)
-    return () => clearTimeout(id)
-  }, [secsLeft, endsAt, onExpire])
+      if (next <= 0 && !firedRef.current) {
+        firedRef.current = true
+        onExpireRef.current?.()
+      }
+    }
+    tick()
+    const id = setInterval(tick, 500)
+    return () => clearInterval(id)
+  }, [endsAt])
 
   const mins = Math.floor(secsLeft / 60)
   const secs = secsLeft % 60

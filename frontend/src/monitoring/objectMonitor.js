@@ -1,182 +1,246 @@
 /**
  * objectMonitor.js
- * Module 3: Object Detection (phone / prohibited items)
+ * Module 3: Object Detection (phones / prohibited items) + person count
  *
- * Uses YOLOv8n (ONNX) via ONNX Runtime Web loaded from CDN.
- * The model is ~6 MB and is fetched once then cached in memory.
+ * Runs a COCO-trained YOLOv8n (ONNX, ~12.8 MB, float32) in the browser via
+ * ONNX Runtime Web (WebAssembly). The model URL is configurable with
+ * VITE_YOLO_MODEL_URL so it can be self-hosted (recommended for exams).
  *
- * COCO class IDs we flag as prohibited:
- *   67 — cell phone
- *   73 — book  (notes)
- *   84 — book (alternate label in some COCO variants)
+ * Pure, testable parts:
+ *   letterbox()        — geometry for aspect-preserving resize to 640×640
+ *   rgbaToTensor()     — RGBA pixels → normalised CHW float32
+ *   decodeYolo()       — [1, 84, N] output → boxes in source-pixel coords
+ *   nms()              — per-class non-maximum suppression
  *
- * Browser limitation note: ONNX Runtime Web runs in the main thread
- * via WebAssembly. Performance varies by device. On low-end hardware
- * the scan interval is automatically stretched to avoid blocking.
+ * Reports, per scan:
+ *   onObjectDetected({ classId, className, confidence, bbox })  flagged classes
+ *   onPersons({ count, confidence })                             'person' count,
+ *       used as a second signal for multiple-person detection
  *
- * Fully independent — no React, no Supabase.
+ * Limitations, stated honestly:
+ *   - Only objects visible to the webcam can be detected; a phone below the
+ *     desk, a second monitor out of frame, earbuds, smart watches or other
+ *     applications on the computer cannot be seen this way.
+ *   - COCO "cell phone" is a general class; a dark phone held edge-on or
+ *     partly hidden is often missed, and some rectangles (remotes, wallets)
+ *     can be mistaken for one. Every detection carries its confidence and
+ *     a snapshot for human review — it is evidence, not a verdict.
+ *   - Inference runs on the main thread via WASM; slow devices simply scan
+ *     less often (a scan is skipped while the previous one is still running).
+ *
+ * YOLOv8 weights are released by Ultralytics under AGPL-3.0.
+ * No React, no Supabase.
  */
 
-const ONNX_CDN      = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/ort.min.js'
-const MODEL_URL     = 'https://huggingface.co/Xenova/yolov8n/resolve/main/onnx/model.onnx'
-const INPUT_SIZE    = 640          // YOLOv8 default input
-const CONF_THRESH   = 0.45
-const SCAN_INTERVAL = 5_000        // ms between scans (heavier than face scan)
+export const INPUT_SIZE = 640
 
-// COCO class indices to flag (0-indexed).
-const FLAGGED_CLASSES = new Set([67])  // 67 = cell phone
-const CLASS_NAMES = { 67: 'cell phone' }
+// Pinned revision of a standard Ultralytics YOLOv8n COCO export.
+export const DEFAULT_MODEL_URL =
+  'https://huggingface.co/webml/yolov8n/resolve/85bc8d7ab30d4065a41909d756c42819b67b4388/onnx/yolov8n.onnx'
 
-let ort        = null   // onnxruntime-web namespace
-let session    = null   // InferenceSession
-let loadingOrt = false
-let loadError  = null
+const ORT_VERSION = '1.18.0'
+const ORT_CDN     = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VERSION}/dist/`
 
-async function loadOrt() {
-  if (ort) return ort
-  if (loadError) throw loadError
-  if (loadingOrt) {
-    // Wait for the in-flight load.
-    await new Promise(res => setTimeout(res, 200))
-    return loadOrt()
-  }
-  loadingOrt = true
-  try {
-    await new Promise((resolve, reject) => {
-      if (document.querySelector(`script[src="${ONNX_CDN}"]`)) { resolve(); return }
-      const s = document.createElement('script')
-      s.src = ONNX_CDN
-      s.onload  = resolve
-      s.onerror = () => reject(new Error('Failed to load ONNX Runtime Web'))
-      document.head.appendChild(s)
-    })
-    ort = window.ort
-    if (!ort) throw new Error('ort not found on window after script load')
-    return ort
-  } catch (err) {
-    loadError = err
-    throw err
-  } finally {
-    loadingOrt = false
-  }
+export const PERSON_CLASS = 0
+
+/** COCO classes flagged by default, with per-class confidence thresholds. */
+export const DEFAULT_FLAGGED = {
+  67: { name: 'cell phone', minConfidence: 0.40 },
+  73: { name: 'book',       minConfidence: 0.50 },
 }
 
-async function ensureSession() {
-  if (session) return session
-  const _ort = await loadOrt()
-  _ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/'
-  session = await _ort.InferenceSession.create(MODEL_URL, {
-    executionProviders: ['wasm'],
-    graphOptimizationLevel: 'all',
-  })
-  return session
+export const OBJECT_DEFAULTS = {
+  scanIntervalMs:   4_000,
+  iouThreshold:      0.45,
+  personMinConfidence: 0.5,
+  flagged: DEFAULT_FLAGGED,
 }
 
-/**
- * Preprocess a video frame into a Float32 tensor [1, 3, 640, 640].
- */
-function preprocess(videoEl) {
-  const canvas = document.createElement('canvas')
-  canvas.width  = INPUT_SIZE
-  canvas.height = INPUT_SIZE
-  const ctx = canvas.getContext('2d')
-  ctx.drawImage(videoEl, 0, 0, INPUT_SIZE, INPUT_SIZE)
-  const { data } = ctx.getImageData(0, 0, INPUT_SIZE, INPUT_SIZE)
+// ── Pure helpers ────────────────────────────────────────────────
 
-  const float32 = new Float32Array(3 * INPUT_SIZE * INPUT_SIZE)
-  for (let i = 0; i < INPUT_SIZE * INPUT_SIZE; i++) {
-    float32[i]                              = data[i * 4]     / 255  // R
-    float32[INPUT_SIZE * INPUT_SIZE + i]    = data[i * 4 + 1] / 255  // G
-    float32[2 * INPUT_SIZE * INPUT_SIZE + i]= data[i * 4 + 2] / 255  // B
+/** Aspect-preserving fit of a srcW×srcH frame into a size×size square. */
+export function letterbox(srcW, srcH, size = INPUT_SIZE) {
+  const scale = Math.min(size / srcW, size / srcH)
+  const w = Math.round(srcW * scale)
+  const h = Math.round(srcH * scale)
+  return { scale, w, h, padX: Math.floor((size - w) / 2), padY: Math.floor((size - h) / 2), size }
+}
+
+/** RGBA Uint8ClampedArray (size×size) → Float32Array CHW in [0, 1]. */
+export function rgbaToTensor(rgba, size = INPUT_SIZE) {
+  const area = size * size
+  const out  = new Float32Array(3 * area)
+  for (let i = 0; i < area; i++) {
+    out[i]            = rgba[i * 4]     / 255
+    out[area + i]     = rgba[i * 4 + 1] / 255
+    out[2 * area + i] = rgba[i * 4 + 2] / 255
   }
-  return float32
+  return out
 }
 
 /**
- * Parse YOLOv8 output tensor [1, 84, 8400] → detections.
- * Returns array of { classId, className, confidence, bbox }.
+ * Decode a YOLOv8 detection head output.
+ * @param {Float32Array} data  flattened [1, 4 + numClasses, numBoxes]
+ * @param {number[]} dims      tensor dims, e.g. [1, 84, 8400]
+ * @param {object} opts
+ * @param {(classId:number) => number|undefined} opts.threshold  min confidence for a class,
+ *        or undefined to ignore that class
+ * @param {object} [opts.lb]   letterbox() result, to map boxes back to source pixels
+ * @returns {{classId:number, confidence:number, bbox:{x:number,y:number,width:number,height:number}}[]}
  */
-function parseOutput(outputData, numClasses = 80) {
-  const numBoxes = 8400
-  const results  = []
-
+export function decodeYolo(data, dims, { threshold, lb }) {
+  const [, rows, numBoxes] = dims
+  const numClasses = rows - 4
+  const out = []
   for (let b = 0; b < numBoxes; b++) {
-    // cx, cy, w, h
-    const cx = outputData[0 * numBoxes + b]
-    const cy = outputData[1 * numBoxes + b]
-    const w  = outputData[2 * numBoxes + b]
-    const h  = outputData[3 * numBoxes + b]
-
-    let maxConf = 0
-    let classId = -1
+    let best = 0, classId = -1
     for (let c = 0; c < numClasses; c++) {
-      const conf = outputData[(4 + c) * numBoxes + b]
-      if (conf > maxConf) { maxConf = conf; classId = c }
+      const s = data[(4 + c) * numBoxes + b]
+      if (s > best) { best = s; classId = c }
     }
+    const min = threshold(classId)
+    if (min === undefined || best < min) continue
 
-    if (maxConf < CONF_THRESH) continue
-    if (!FLAGGED_CLASSES.has(classId)) continue
-
-    results.push({
-      classId,
-      className:  CLASS_NAMES[classId] ?? `class_${classId}`,
-      confidence: maxConf,
-      bbox: { cx, cy, w, h },
-    })
+    const cx = data[b], cy = data[numBoxes + b], w = data[2 * numBoxes + b], h = data[3 * numBoxes + b]
+    let x = cx - w / 2, y = cy - h / 2, width = w, height = h
+    if (lb) {
+      x = (x - lb.padX) / lb.scale; y = (y - lb.padY) / lb.scale
+      width /= lb.scale;            height /= lb.scale
+    }
+    out.push({ classId, confidence: best, bbox: { x, y, width, height } })
   }
-  return results
+  return out
+}
+
+export function iou(a, b) {
+  const x1 = Math.max(a.x, b.x), y1 = Math.max(a.y, b.y)
+  const x2 = Math.min(a.x + a.width, b.x + b.width), y2 = Math.min(a.y + a.height, b.y + b.height)
+  const inter = Math.max(0, x2 - x1) * Math.max(0, y2 - y1)
+  const union = a.width * a.height + b.width * b.height - inter
+  return union > 0 ? inter / union : 0
+}
+
+/** Greedy per-class non-maximum suppression. */
+export function nms(dets, iouThreshold = OBJECT_DEFAULTS.iouThreshold) {
+  const sorted = [...dets].sort((a, b) => b.confidence - a.confidence)
+  const keep = []
+  for (const d of sorted) {
+    if (keep.every(k => k.classId !== d.classId || iou(k.bbox, d.bbox) < iouThreshold)) keep.push(d)
+  }
+  return keep
 }
 
 /**
- * Start object monitoring on a video element.
+ * Turn raw model output into the monitor's per-scan result.
+ * Shared by the browser adapter and the real-model test.
+ */
+export function analyseOutput(data, dims, lb, cfg = OBJECT_DEFAULTS) {
+  const threshold = c =>
+    c === PERSON_CLASS ? cfg.personMinConfidence : cfg.flagged[c]?.minConfidence
+  const kept    = nms(decodeYolo(data, dims, { threshold, lb }), cfg.iouThreshold)
+  const persons = kept.filter(d => d.classId === PERSON_CLASS)
+  const objects = kept
+    .filter(d => d.classId !== PERSON_CLASS)
+    .map(d => ({ ...d, className: cfg.flagged[d.classId].name }))
+  return { objects, persons }
+}
+
+// ── Browser adapter ─────────────────────────────────────────────
+
+let ortPromise     = null
+const sessionCache = new Map()
+
+function loadOrt() {
+  ortPromise ??= new Promise((resolve, reject) => {
+    if (globalThis.ort) return resolve(globalThis.ort)
+    const s = document.createElement('script')
+    s.src     = `${ORT_CDN}ort.min.js`
+    s.onload  = () => globalThis.ort ? resolve(globalThis.ort) : reject(new Error('onnxruntime-web did not initialise'))
+    s.onerror = () => reject(new Error('Failed to load ONNX Runtime Web'))
+    document.head.appendChild(s)
+  }).catch(err => { ortPromise = null; throw err })
+  return ortPromise
+}
+
+async function defaultRunner(modelUrl) {
+  const ort = await loadOrt()
+  ort.env.wasm.wasmPaths = ORT_CDN
+  let session = sessionCache.get(modelUrl)
+  if (!session) {
+    session = ort.InferenceSession.create(modelUrl, { executionProviders: ['wasm'], graphOptimizationLevel: 'all' })
+    sessionCache.set(modelUrl, session)
+    session.catch(() => sessionCache.delete(modelUrl))
+  }
+  const sess = await session
+
+  const canvas = document.createElement('canvas')
+  canvas.width = canvas.height = INPUT_SIZE
+  const ctx = canvas.getContext('2d', { willReadFrequently: true })
+
+  return async videoEl => {
+    const lb = letterbox(videoEl.videoWidth || INPUT_SIZE, videoEl.videoHeight || INPUT_SIZE)
+    ctx.fillStyle = 'rgb(114,114,114)'                      // Ultralytics pad colour
+    ctx.fillRect(0, 0, INPUT_SIZE, INPUT_SIZE)
+    ctx.drawImage(videoEl, lb.padX, lb.padY, lb.w, lb.h)
+    const { data } = ctx.getImageData(0, 0, INPUT_SIZE, INPUT_SIZE)
+    const input  = new ort.Tensor('float32', rgbaToTensor(data), [1, 3, INPUT_SIZE, INPUT_SIZE])
+    const result = await sess.run({ [sess.inputNames[0]]: input })
+    const output = result[sess.outputNames[0]]
+    return { data: output.data, dims: output.dims, lb }
+  }
+}
+
+/**
+ * Start object monitoring. Returns stop() immediately; ONNX Runtime and the
+ * model load in the background.
  *
  * @param {HTMLVideoElement} videoEl
  * @param {object} callbacks
- * @param {function} callbacks.onObjectDetected ({ className, confidence }) => void
- * @param {function} callbacks.onModelReady     () => void
- * @param {function} callbacks.onModelError     (err: Error) => void
+ * @param {function} [callbacks.onObjectDetected] ({ classId, className, confidence, bbox }) => void
+ * @param {function} [callbacks.onPersons]        ({ count, confidence }) => void
+ * @param {function} [callbacks.onReady]          () => void
+ * @param {function} [callbacks.onError]          (err) => void
+ * @param {object}   [options] OBJECT_DEFAULTS overrides, `modelUrl`, and
+ *                   `createRunner(modelUrl) => Promise<run(videoEl)>` for tests
  * @returns {function} stop
  */
-export async function startObjectMonitor(videoEl, { onObjectDetected, onModelReady, onModelError }) {
+export function startObjectMonitor(videoEl, callbacks = {}, options = {}) {
+  const { onObjectDetected, onPersons, onReady, onError, onTiming } = callbacks
+  const cfg = { ...OBJECT_DEFAULTS, ...options }
+  const modelUrl = options.modelUrl ?? import.meta.env?.VITE_YOLO_MODEL_URL ?? DEFAULT_MODEL_URL
+
   let stopped = false
+  let busy    = false
+  let intervalId
 
-  // Load model in background — don't block exam start.
-  let sess
-  try {
-    sess = await ensureSession()
-    onModelReady?.()
-  } catch (err) {
-    onModelError?.(err)
-    // Return a no-op stop function; monitoring simply won't run.
-    return () => {}
-  }
+  ;(options.createRunner ?? defaultRunner)(modelUrl).then(run => {
+    if (stopped) return
+    onReady?.()
 
-  const _ort = await loadOrt()
-
-  async function scan() {
-    if (stopped || !videoEl || videoEl.readyState < 2) return
-
-    try {
-      const float32 = preprocess(videoEl)
-      const tensor  = new _ort.Tensor('float32', float32, [1, 3, INPUT_SIZE, INPUT_SIZE])
-      const feeds    = { images: tensor }
-      const results  = await sess.run(feeds)
-
-      // YOLOv8 output key is typically 'output0'
-      const outputKey  = Object.keys(results)[0]
-      const outputData = results[outputKey].data
-
-      const detections = parseOutput(outputData)
-      for (const det of detections) {
-        onObjectDetected?.(det)
+    async function scan() {
+      if (stopped || busy || !videoEl || videoEl.readyState < 2) return
+      busy = true
+      try {
+        const t0 = performance.now()
+        const { data, dims, lb } = await run(videoEl)
+        if (stopped) return
+        const { objects, persons } = analyseOutput(data, dims, lb, cfg)
+        onTiming?.(performance.now() - t0)   // preprocess + inference + decode (ms)
+        for (const obj of objects) onObjectDetected?.(obj)
+        onPersons?.({
+          count: persons.length,
+          confidence: persons.length ? Math.min(...persons.map(p => p.confidence)) : null,
+        })
+      } catch (err) {
+        console.warn('[objectMonitor] inference error:', err.message)
+      } finally {
+        busy = false
       }
-    } catch (err) {
-      // Transient inference errors are non-fatal.
-      console.warn('[objectMonitor] inference error:', err.message)
     }
-  }
 
-  const intervalId = setInterval(scan, SCAN_INTERVAL)
+    intervalId = setInterval(scan, cfg.scanIntervalMs)
+    scan()
+  }, err => { if (!stopped) onError?.(err) })
 
   return function stop() {
     stopped = true

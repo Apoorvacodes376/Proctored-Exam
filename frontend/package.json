@@ -7,7 +7,10 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "oxlint",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:assets": "node scripts/fetch-test-assets.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.118.0",
@@ -18,12 +21,18 @@
     "react-router-dom": "^7.18.4"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "^0.5.11",
     "@tailwindcss/vite": "^4.3.3",
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.7",
     "@vitejs/plugin-react": "^6.1.1",
+    "happy-dom": "^21.0.4",
+    "jpeg-js": "^0.4.4",
+    "onnxruntime-node": "^1.30.0",
     "oxlint": "^1.81.0",
     "tailwindcss": "^4.3.3",
-    "vite": "^8.3.0"
+    "vite": "^8.3.0",
+    "vitest": "^5.0.5",
+    "ws": "^8.22.0"
   }
 }

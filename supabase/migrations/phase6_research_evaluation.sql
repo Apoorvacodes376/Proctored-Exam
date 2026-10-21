@@ -270,6 +270,7 @@ alter table public.feedback enable row level security;
 
 drop policy if exists "Students submit own feedback"       on public.feedback;
 drop policy if exists "Faculty view feedback for exams"    on public.feedback;
+drop policy if exists "Students view own feedback"         on public.feedback;  -- was missing: re-running this file failed
 
 -- Students: insert their own feedback (one per session, enforced by unique).
 create policy "Students submit own feedback"

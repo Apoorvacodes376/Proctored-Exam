@@ -1,62 +1,109 @@
 /**
  * streamMonitor.js
- * Module 5: Camera & Microphone Status Monitoring
+ * Module 5: Camera & Microphone Status
  *
- * Polls MediaStreamTrack.readyState and .muted at a regular interval.
- * Fires callbacks on state transitions only (not on every poll tick),
- * preventing duplicate alerts during a single continuous interruption.
+ * Watches the camera and microphone tracks of a MediaStream and reports
+ * each continuous interruption exactly once:
+ *   onLost(kind, reason)        kind: 'camera' | 'microphone'
+ *   onRestored(kind, downtimeMs)
  *
- * Fully independent — no React, no Supabase.
+ * reason is one of:
+ *   'missing'            no track of that kind in the stream (not granted / no device)
+ *   'ended'              track stopped (device unplugged, permission revoked,
+ *                        another app took the device, OS privacy switch)
+ *   'muted'              browser/OS stopped delivering frames/samples (e.g. a
+ *                        hardware privacy shutter or the OS mic mute on some
+ *                        platforms) — may recover by itself
+ *   'permission_revoked' Permissions API reports the permission was withdrawn
+ *
+ * An ended track never comes back; the caller must request a new stream and
+ * start a new monitor (useProctoring does this via "Reconnect").
+ *
+ * Browser limitations: not every OS-level mute is visible to the page — a
+ * physical camera cover or a muted headset may still deliver black frames
+ * or silence while the track reports "live". Face presence and audio level
+ * are the backstop for those cases.
+ *
+ * Detection uses track events plus a poll, because not all browsers fire
+ * 'mute'/'ended' reliably. No React, no Supabase.
  */
 
 const POLL_MS = 2_000
 
 /**
- * Start stream status monitoring.
- *
  * @param {MediaStream} stream
  * @param {object} callbacks
- * @param {function} callbacks.onCameraLost     () => void
- * @param {function} callbacks.onCameraRestored () => void
- * @param {function} callbacks.onMicLost        () => void
- * @param {function} callbacks.onMicRestored    () => void
+ * @param {function} [callbacks.onLost]      (kind, reason) => void
+ * @param {function} [callbacks.onRestored]  (kind, downtimeMs) => void
+ * @param {object}   [options]
+ * @param {Permissions} [options.permissions]  defaults to navigator.permissions
+ * @param {number}      [options.pollMs]
  * @returns {function} stop
  */
-export function startStreamMonitor(stream, { onCameraLost, onCameraRestored, onMicLost, onMicRestored }) {
+export function startStreamMonitor(stream, { onLost, onRestored } = {}, options = {}) {
+  const permissions = options.permissions !== undefined ? options.permissions : globalThis.navigator?.permissions
+  const pollMs = options.pollMs ?? POLL_MS
+
   let stopped = false
+  const cleanups = []
 
-  const videoTrack = stream.getVideoTracks()[0] ?? null
-  const audioTrack = stream.getAudioTracks()[0] ?? null
-
-  // Track last known states to detect transitions.
-  let camOk = videoTrack ? (videoTrack.readyState === 'live' && !videoTrack.muted) : false
-  let micOk = audioTrack ? (audioTrack.readyState === 'live' && !audioTrack.muted) : false
-
-  function checkTrack(track, wasOk, onLost, onRestored) {
-    if (!track) return wasOk
-    const isOk = track.readyState === 'live' && !track.muted
-    if (wasOk && !isOk) { onLost?.() }
-    if (!wasOk && isOk) { onRestored?.() }
-    return isOk
+  const channels = {
+    camera:     { track: stream?.getVideoTracks?.()[0] ?? null, perm: 'camera',     revoked: false, lostAt: null },
+    microphone: { track: stream?.getAudioTracks?.()[0] ?? null, perm: 'microphone', revoked: false, lostAt: null },
   }
 
-  const pollId = setInterval(() => {
+  function reasonFor(ch) {
+    if (!ch.track)                       return 'missing'
+    if (ch.revoked)                      return 'permission_revoked'
+    if (ch.track.readyState === 'ended') return 'ended'
+    if (ch.track.muted)                  return 'muted'
+    return null
+  }
+
+  function evaluate(kind) {
     if (stopped) return
-    camOk = checkTrack(videoTrack, camOk, onCameraLost, onCameraRestored)
-    micOk = checkTrack(audioTrack, micOk, onMicLost,    onMicRestored)
-  }, POLL_MS)
+    const ch = channels[kind]
+    const reason = reasonFor(ch)
+    if (reason && ch.lostAt === null) {
+      ch.lostAt = Date.now()
+      onLost?.(kind, reason)
+    } else if (!reason && ch.lostAt !== null) {
+      const downtime = Date.now() - ch.lostAt
+      ch.lostAt = null
+      onRestored?.(kind, downtime)
+    }
+  }
 
-  // Also listen to native 'ended' events for immediate notification.
-  function handleVideoEnded() { if (!stopped && camOk) { camOk = false; onCameraLost?.() } }
-  function handleAudioEnded() { if (!stopped && micOk) { micOk = false; onMicLost?.()   } }
+  for (const [kind, ch] of Object.entries(channels)) {
+    if (ch.track) {
+      const handler = () => evaluate(kind)
+      for (const type of ['ended', 'mute', 'unmute']) {
+        ch.track.addEventListener(type, handler)
+        cleanups.push(() => ch.track.removeEventListener(type, handler))
+      }
+    }
 
-  videoTrack?.addEventListener('ended', handleVideoEnded)
-  audioTrack?.addEventListener('ended', handleAudioEnded)
+    // Permission withdrawal (Chrome/Edge/Firefox support querying camera &
+    // microphone; Safari may throw — then we rely on track state alone).
+    permissions?.query?.({ name: ch.perm }).then(status => {
+      if (stopped) return
+      const update = () => {
+        ch.revoked = status.state === 'denied'
+        evaluate(kind)
+      }
+      status.addEventListener?.('change', update)
+      cleanups.push(() => status.removeEventListener?.('change', update))
+      update()
+    }, () => { /* unsupported permission name */ })
+  }
+
+  const pollId = setInterval(() => { evaluate('camera'); evaluate('microphone') }, pollMs)
+  evaluate('camera')
+  evaluate('microphone')
 
   return function stop() {
     stopped = true
     clearInterval(pollId)
-    videoTrack?.removeEventListener('ended', handleVideoEnded)
-    audioTrack?.removeEventListener('ended', handleAudioEnded)
+    cleanups.forEach(fn => fn())
   }
 }
