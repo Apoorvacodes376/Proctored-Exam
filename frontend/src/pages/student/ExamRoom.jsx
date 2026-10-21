@@ -26,6 +26,35 @@ function Shell({ children }) {
   )
 }
 
+function MonitoringConsent({ onContinue }) {
+  return (
+    <div className="space-y-4 text-sm text-gray-600 dark:text-gray-300">
+      <div className="flex items-start gap-2 px-3 py-2.5 bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded-xl">
+        <ShieldCheck size={16} strokeWidth={1.75} className="shrink-0 mt-0.5 text-green-600 dark:text-green-400" />
+        <p>This is a proctored exam. Your browser will ask for <strong>camera and microphone</strong> access when you continue.</p>
+      </div>
+      <div className="space-y-1.5">
+        <p className="font-semibold text-gray-900 dark:text-white">While the exam is running we monitor:</p>
+        <ul className="list-disc pl-5 space-y-1">
+          <li>that your face is visible and you are alone in view;</li>
+          <li>phones and books visible to the webcam;</li>
+          <li>sustained speech and loud noise (analysed on your device, not recorded);</li>
+          <li>your camera and microphone staying on;</li>
+          <li>leaving the exam tab or window.</li>
+        </ul>
+        <p>A webcam snapshot is saved only when an alert occurs, and only your faculty can see it. A "Monitoring active" panel stays on screen throughout.</p>
+        <p className="text-xs text-gray-500 dark:text-gray-400">
+          A browser cannot detect other devices, other applications or anything outside the camera's view, and alerts can be wrong — every alert is reviewed by a person.
+        </p>
+      </div>
+      <button onClick={onContinue}
+        className="w-full py-2.5 bg-green-600 hover:bg-green-700 text-white text-sm font-semibold rounded-xl transition-colors">
+        I understand — continue
+      </button>
+    </div>
+  )
+}
+
 function QuestionNav({ questions, current, answers, onSelect }) {
   return (
     <div className="flex flex-wrap gap-1.5">
@@ -66,12 +95,15 @@ export default function ExamRoom() {
   const [answers, setAnswers]       = useState({})
   const [current, setCurrent]       = useState(0)
   const [saving, setSaving]         = useState(false)
+  const [saveError, setSaveError]   = useState('')
   const [submitOpen, setSubmitOpen] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [loadError, setLoadError]   = useState('')
 
   // Stream passed from VerificationGate → kept alive for monitoring.
   const [liveStream, setLiveStream] = useState(null)
+  // Student has read what is monitored before the browser asks for camera/mic.
+  const [consented, setConsented] = useState(false)
 
   const endsAtRef    = useRef(null)
   const dirtyRef     = useRef(false)
@@ -82,6 +114,7 @@ export default function ExamRoom() {
   // ── Proctoring ────────────────────────────────────────────
   const { status: procStatus, dismissAlert } = useProctoring({
     examSessionId:  session?.id ?? null,
+    examId:         exam?.id ?? null,
     studentId:      student?.id ?? null,
     active:         phase === 'exam',
     existingStream: liveStream,
@@ -110,11 +143,9 @@ export default function ExamRoom() {
       const now = new Date()
       if (now < start || now > end) { setPhase('outside_window'); return }
 
-      const { data: qs } = await supabase
-        .from('questions')
-        .select('id,question_text,question_type,options,correct_answer,marks,order_index')
-        .eq('exam_id', examId)
-        .order('order_index')
+      // Served without the answer key (Phase 6); see get_exam_questions().
+      const { data: qs, error: qErr } = await supabase.rpc('get_exam_questions', { p_exam_id: examId })
+      if (qErr) throw qErr
       setQuestions(qs || [])
 
       const { data: existing } = await supabase
@@ -161,6 +192,23 @@ export default function ExamRoom() {
     }
   }, [phase]) // eslint-disable-line react-hooks/exhaustive-deps
 
+  // ── Identity verification log (Phase 5) ─────────────────
+  // Kept separate from behavioural proctoring events. Insert-only: students
+  // cannot read these rows back.
+  const logIdentity = useCallback(async ({ result, distance = null, threshold = null }) => {
+    if (!exam?.id || !student?.id) return
+    const round = x => (x === null || x === undefined ? null : Math.round(x * 10_000) / 10_000)
+    const { error } = await supabase.from('identity_verifications').insert({
+      exam_id: exam.id, student_id: student.id, result, distance: round(distance), threshold: round(threshold),
+    })
+    if (error) console.warn('[ExamRoom] could not log identity verification:', error.message)
+  }, [exam?.id, student?.id])
+
+  function requestManualReview(result = 'manual_review_requested') {
+    logIdentity({ result })
+    setPhase('manual_review')
+  }
+
   // ── Create session after verification ────────────────────
   async function handleVerified(stream) {
     // stream is passed from VerificationGate after it stops its own tracks.
@@ -200,7 +248,10 @@ export default function ExamRoom() {
     const upserts = Object.entries(snap)
       .map(([question_id, answer_text]) => ({ session_id: sessionId, question_id, answer_text: answer_text ?? '' }))
     if (upserts.length) {
-      await supabase.from('exam_answers').upsert(upserts, { onConflict: 'session_id,question_id' })
+      // The server refuses changes after submission or once time is up.
+      const { error } = await supabase.from('exam_answers').upsert(upserts, { onConflict: 'session_id,question_id' })
+      setSaveError(error ? error.message : '')
+      if (error) { setSaving(false); return }
     }
     dirtyRef.current = false
     setSaving(false)
@@ -320,18 +371,21 @@ export default function ExamRoom() {
             <h1 className="text-lg font-bold text-gray-900 dark:text-white">{exam?.title}</h1>
             <p className="text-sm text-gray-500 dark:text-gray-400 mt-0.5">{exam?.subject}</p>
           </div>
-          {student?.photo_url
+          {!consented
+            ? <MonitoringConsent onContinue={() => setConsented(true)} />
+            : student?.photo_url
             ? <VerificationGate
                 referencePhotoUrl={student.photo_url}
                 onVerified={handleVerified}
-                onManualReview={() => setPhase('manual_review')}
+                onManualReview={() => requestManualReview()}
+                onAttempt={logIdentity}
               />
             : <div className="space-y-4 py-4">
                 <div className="flex items-start gap-2 px-3 py-2.5 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-xl text-sm text-amber-700 dark:text-amber-400">
                   <AlertCircle size={15} strokeWidth={1.75} className="shrink-0 mt-0.5" />
                   No reference photograph on file. Your faculty must upload one before identity verification can proceed.
                 </div>
-                <button onClick={() => setPhase('manual_review')}
+                <button onClick={() => requestManualReview('no_reference_photo')}
                   className="w-full py-2.5 bg-amber-600 hover:bg-amber-700 text-white text-sm font-semibold rounded-xl transition-colors">
                   Request Manual Review
                 </button>
@@ -348,16 +402,6 @@ export default function ExamRoom() {
 
   return (
     <div className="min-h-screen bg-gray-50 dark:bg-gray-950 flex flex-col">
-      {/* Hidden video element for monitoring — not shown to student */}
-      <video
-        ref={monitorVideoRef}
-        autoPlay
-        muted
-        playsInline
-        style={{ position: 'absolute', width: 1, height: 1, opacity: 0, pointerEvents: 'none' }}
-        aria-hidden="true"
-      />
-
       {/* Top bar */}
       <header className="bg-white dark:bg-gray-900 border-b border-gray-200 dark:border-gray-800 px-6 py-3 flex items-center justify-between shrink-0">
         <div className="min-w-0">
@@ -371,6 +415,11 @@ export default function ExamRoom() {
           {saving && (
             <span className="text-xs text-gray-400 flex items-center gap-1">
               <Loader2 size={11} className="animate-spin" /> Saving…
+            </span>
+          )}
+          {!saving && saveError && (
+            <span className="text-xs text-red-600 dark:text-red-400 max-w-[16rem] truncate" title={saveError} role="alert">
+              Not saved: {saveError}
             </span>
           )}
           {endsAtRef.current && (
@@ -477,8 +526,9 @@ export default function ExamRoom() {
         </aside>
       </div>
 
-      {/* Proctoring overlay — fixed bottom-right */}
-      <ProctoringOverlay status={procStatus} onDismiss={dismissAlert} />
+      {/* Proctoring overlay — fixed bottom-right; shows the webcam self-view
+          that the monitoring modules also read from. */}
+      <ProctoringOverlay status={procStatus} onDismiss={dismissAlert} videoRef={monitorVideoRef} />
 
       <ConfirmDialog
         open={submitOpen}

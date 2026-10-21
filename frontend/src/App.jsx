@@ -11,6 +11,11 @@ import ExamRoom from './pages/student/ExamRoom'
 import FacultyDashboard from './pages/FacultyDashboard'
 import FacultyStudents from './pages/faculty/FacultyStudents'
 import FacultyExams from './pages/faculty/FacultyExams'
+import MonitorPage from './pages/faculty/MonitorPage'
+import ReviewPage from './pages/faculty/ReviewPage'
+import SessionReviewPage from './pages/faculty/SessionReviewPage'
+import EvaluationPage from './pages/faculty/EvaluationPage'
+import AnnotatePage from './pages/faculty/AnnotatePage'
 
 function FacultyRoute({ children }) {
   return (
@@ -49,6 +54,11 @@ export default function App() {
             <Route path="/faculty" element={<FacultyRoute><FacultyDashboard /></FacultyRoute>} />
             <Route path="/faculty/students" element={<FacultyRoute><FacultyStudents /></FacultyRoute>} />
             <Route path="/faculty/exams" element={<FacultyRoute><FacultyExams /></FacultyRoute>} />
+            <Route path="/faculty/monitor" element={<FacultyRoute><MonitorPage /></FacultyRoute>} />
+            <Route path="/faculty/review" element={<FacultyRoute><ReviewPage /></FacultyRoute>} />
+            <Route path="/faculty/review/:sessionId" element={<FacultyRoute><SessionReviewPage /></FacultyRoute>} />
+            <Route path="/faculty/evaluation" element={<FacultyRoute><EvaluationPage /></FacultyRoute>} />
+            <Route path="/faculty/evaluation/annotate/:sessionId" element={<FacultyRoute><AnnotatePage /></FacultyRoute>} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
         </BrowserRouter>

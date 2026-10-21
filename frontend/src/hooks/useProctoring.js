@@ -1,246 +1,385 @@
 /**
  * useProctoring.js
- * Orchestrates all Phase 4 monitoring modules for an active exam session.
+ * Orchestrates the Phase 4 monitoring modules for an active exam session.
  *
- * Responsibilities:
- *  - Acquire camera + microphone stream (reuses stream from VerificationGate
- *    if passed in, otherwise requests a new one).
- *  - Start all monitoring modules once the exam phase begins.
- *  - Route callbacks → eventLogger (Supabase writes).
- *  - Expose live status state for the ProctoringOverlay UI.
- *  - Stop all monitors and release the stream on unmount or exam end.
+ *  - Starts tab/focus monitoring immediately (needs no camera or model).
+ *  - Acquires camera + microphone (reuses the stream from VerificationGate
+ *    when it is still live) and starts stream-status and audio monitors.
+ *  - Loads the face and object models in the background — nothing waits
+ *    on a model download.
+ *  - Turns monitor callbacks into one logged event per continuous episode,
+ *    with webcam evidence at alert points, and notifies the student.
+ *  - Exposes `reconnect()` to re-acquire a camera/mic whose track ended.
  *
- * Props:
- *  @param {string}            examSessionId
- *  @param {string}            studentId
- *  @param {boolean}           active          — true only during 'exam' phase
- *  @param {MediaStream|null}  existingStream  — stream from VerificationGate
- *  @param {React.RefObject}   videoRef        — <video> element ref
+ *  - Records per-module processing time and reports one summary per
+ *    minute to monitoring_performance (Phase 6 evaluation).
+ *
+ * All detection logic lives in src/monitoring/* and is tested there.
  */
 
 import { useEffect, useRef, useState, useCallback } from 'react'
+import { supabase } from '../lib/supabase'
 import { startFaceMonitor }   from '../monitoring/faceMonitor'
 import { startObjectMonitor } from '../monitoring/objectMonitor'
 import { startAudioMonitor }  from '../monitoring/audioMonitor'
 import { startStreamMonitor } from '../monitoring/streamMonitor'
 import { startTabMonitor }    from '../monitoring/tabMonitor'
-import {
-  ensureProctoringSession,
-  endProctoringSession,
-  logEvent,
-  captureAndUploadSnapshot,
-  resetCooldowns,
-} from '../monitoring/eventLogger'
+import { createEventLogger, captureVideoFrame } from '../monitoring/eventLogger'
+import { createEpisodes, createHitWindow } from '../monitoring/episodes'
+import { createHeartbeat } from '../monitoring/heartbeat'
+import { createLatencyRecorder, deviceInfo } from '../monitoring/latency'
 
-export function useProctoring({ examSessionId, studentId, active, existingStream, videoRef }) {
-  // ── Live status exposed to ProctoringOverlay ──────────────
-  const [status, setStatus] = useState({
-    cameraOk:      true,
-    micOk:         true,
-    facePresent:   true,
-    objectModel:   'loading',   // 'loading' | 'ready' | 'unavailable'
-    alerts:        [],          // [{ id, type, message, severity, ts }]
-  })
+const FLUSH_MS     = 15_000
+const AUTO_DISMISS = 8_000
 
-  const procSessionRef = useRef(null)   // proctoring_sessions.id
-  const streamRef      = useRef(null)   // MediaStream
-  const stopFns        = useRef([])     // cleanup functions from each module
+const FACE_GRACE_MS = Number(import.meta.env.VITE_FACE_GRACE_MS) || 8_000
 
-  // ── Alert helpers ─────────────────────────────────────────
-  const addAlert = useCallback((type, message, severity = 'medium') => {
-    const alert = { id: `${type}-${Date.now()}`, type, message, severity, ts: Date.now() }
-    setStatus(s => ({
-      ...s,
-      alerts: [alert, ...s.alerts].slice(0, 10),  // keep last 10
-    }))
-    // Auto-dismiss low/medium alerts after 8 s.
-    if (severity === 'low' || severity === 'medium') {
-      setTimeout(() => {
-        setStatus(s => ({ ...s, alerts: s.alerts.filter(a => a.id !== alert.id) }))
-      }, 8_000)
-    }
-  }, [])
+const REASON_TEXT = {
+  missing:            'is not available — access was not granted or no device was found',
+  ended:              'stopped — it may have been unplugged, disabled or taken by another app',
+  muted:              'is not sending any signal (muted or covered)',
+  permission_revoked: 'permission was withdrawn in the browser',
+}
 
-  const dismissAlert = useCallback((id) => {
+const INITIAL_STATUS = {
+  active:     false,
+  camera:     'pending',    // 'pending' | 'ok' | 'lost'
+  microphone: 'pending',
+  face:       'loading',    // 'loading' | 'present' | 'absent' | 'unavailable'
+  objects:    'loading',    // 'loading' | 'active' | 'unavailable'
+  audio:      'loading',    // 'loading' | 'running' | 'suspended' | 'unavailable'
+  logging:    'connecting', // 'connecting' | 'ok' | 'retrying' | 'error'
+  away:       false,        // exam tab hidden / window unfocused
+  alerts:     [],           // [{ id, message, severity, action? }]
+}
+
+function healthy(track) {
+  return !!track && track.readyState === 'live' && !track.muted
+}
+
+function secs(ms) {
+  return ms < 60_000 ? `${Math.max(1, Math.round(ms / 1000))} s` : `${Math.round(ms / 60_000)} min`
+}
+
+export function useProctoring({ examSessionId, examId, studentId, active, existingStream, videoRef }) {
+  const [status, setStatus] = useState(INITIAL_STATUS)
+  const patch = useCallback(p => setStatus(s => ({ ...s, ...p })), [])
+
+  const reconnectRef = useRef(null)
+  const timers = useRef(new Set())
+
+  // ── Student notifications ─────────────────────────────────
+  // Alerts are keyed so a persistent condition shows one alert, which is
+  // replaced/removed as the condition changes.
+  const dismissAlert = useCallback(id => {
     setStatus(s => ({ ...s, alerts: s.alerts.filter(a => a.id !== id) }))
   }, [])
 
-  // ── Snapshot helper ───────────────────────────────────────
-  async function snapshot() {
-    if (!videoRef?.current || !procSessionRef.current) return null
-    return captureAndUploadSnapshot(videoRef.current, procSessionRef.current, examSessionId)
-  }
+  const notify = useCallback((id, message, severity = 'medium', { persist = false, action = null } = {}) => {
+    setStatus(s => ({
+      ...s,
+      alerts: [{ id, message, severity, action }, ...s.alerts.filter(a => a.id !== id)].slice(0, 6),
+    }))
+    if (!persist) {
+      const t = setTimeout(() => { timers.current.delete(t); dismissAlert(id) }, AUTO_DISMISS)
+      timers.current.add(t)
+    }
+  }, [dismissAlert])
 
-  // ── Main effect: start / stop monitoring ─────────────────
+  // ── Main lifecycle ────────────────────────────────────────
   useEffect(() => {
     if (!active || !examSessionId) return
 
     let cancelled = false
+    const pendingTimers = timers.current
+    const stops = []
+    let streamStops = []
+    let ownedStream = null
+    let currentStream = null
 
-    async function start() {
-      resetCooldowns()
+    const video  = () => videoRef?.current ?? null
+    const logger = createEventLogger({
+      client: supabase,
+      examSessionId,
+      studentId,
+      examId,
+      captureFrame: () => captureVideoFrame(video()),
+    })
 
-      // 1. Acquire stream (reuse existing or request new).
-      let stream = existingStream
-      if (!stream || stream.getTracks().every(t => t.readyState === 'ended')) {
-        try {
-          stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true })
-        } catch (err) {
-          console.warn('[useProctoring] media access failed:', err.message)
-          setStatus(s => ({ ...s, cameraOk: false, micOk: false }))
-          return
-        }
-      }
-      if (cancelled) { stream.getTracks().forEach(t => t.stop()); return }
-      streamRef.current = stream
+    // Events raised before the session row exists wait for it.
+    const ready = logger.start().then(
+      () => { if (!cancelled) patch({ logging: 'ok' }) },
+      err => {
+        console.warn('[useProctoring] cannot create proctoring session:', err.message)
+        if (!cancelled) patch({ logging: 'error' })
+        throw err
+      },
+    )
+    ready.catch(() => {})
 
-      // Attach stream to video element if not already set.
-      if (videoRef?.current && !videoRef.current.srcObject) {
-        videoRef.current.srcObject = stream
-      }
+    const gatedLogger = {
+      log:   async e => { await ready; return logger.log(e) },
+      close: async (id, at) => { await ready; return logger.close(id, at) },
+    }
+    const episodes = createEpisodes(gatedLogger, {
+      onError: err => console.warn('[useProctoring] event not logged:', err.message),
+    })
+    const once = e => gatedLogger.log(e).catch(err => console.warn('[useProctoring] event not logged:', err.message))
 
-      // 2. Create proctoring_session row.
-      let procSession
-      try {
-        procSession = await ensureProctoringSession(examSessionId, { webcamEnabled: true })
-        procSessionRef.current = procSession.id
-      } catch (err) {
-        console.warn('[useProctoring] could not create proctoring session:', err.message)
-        // Continue monitoring even if DB write fails — don't block the student.
-      }
-      if (cancelled) return
+    // Processing-latency measurements (device-dependent; see monitoring/latency.js).
+    const device = deviceInfo()
+    const latency = createLatencyRecorder({
+      onFlush: rows => {
+        supabase.from('monitoring_performance')
+          .insert(rows.map(r => ({ ...r, exam_session_id: examSessionId, device })))
+          .then(({ error }) => { if (error) console.warn('[useProctoring] latency not recorded:', error.message) })
+      },
+    })
+    latency.start()
 
-      const psId = procSessionRef.current
+    patch({ ...INITIAL_STATUS, active: true, alerts: [] })
 
-      // Helper: log event + optional snapshot.
-      async function emit(eventType, severity, confidence, withSnapshot = false, metadata = null) {
-        if (!psId) return
-        let snapshotId = null
-        if (withSnapshot) snapshotId = await snapshot()
-        await logEvent(psId, { eventType, severity, confidence, snapshotId, metadata })
-      }
+    // ── 6. Tab / focus — first, so nothing delays it ──
+    stops.push(startTabMonitor({
+      onLeave: ({ reason, at }) => {
+        patch({ away: true })
+        episodes.open('away', {
+          eventType: reason === 'tab_hidden' ? 'tab_switch' : 'focus_lost',
+          occurredAt: at,
+          metadata: { reason },
+        })
+      },
+      onReturn: ({ reason, awayMs, at }) => {
+        patch({ away: false })
+        episodes.close('away', at)
+        notify('away',
+          reason === 'tab_hidden'
+            ? `You left the exam tab for ${secs(awayMs)}. This has been recorded.`
+            : `The exam window lost focus for ${secs(awayMs)}. This has been recorded.`,
+          reason === 'tab_hidden' ? 'high' : 'medium')
+      },
+    }))
 
-      // 3. Face monitor.
-      const stopFace = await startFaceMonitor(videoRef?.current, {
-        onFaceAbsent: (durationMs) => {
-          setStatus(s => ({ ...s, facePresent: false }))
-          addAlert('face_not_detected', 'Your face is not visible. Please look at the camera.', 'high')
-          emit('face_not_detected', 'high', null, true)
-        },
-        onFacePresent: () => {
-          setStatus(s => ({ ...s, facePresent: true }))
-          dismissAlert('face_not_detected')
-        },
-        onMultipleFaces: (count, confidence) => {
-          addAlert('multiple_faces', `${count} people detected in frame.`, 'critical')
-          emit('multiple_faces', 'critical', confidence, true, { count })
-        },
-      }).catch(err => {
-        console.warn('[useProctoring] faceMonitor failed to start:', err.message)
-        return () => {}
+    // ── 5. Camera / microphone status ──
+    const kindInfo = {
+      camera:     { key: 'camera', eventType: 'camera_interrupted', label: 'Camera' },
+      microphone: { key: 'mic',    eventType: 'mic_interrupted',    label: 'Microphone' },
+    }
+    let mediaError = null
+
+    function onLost(kind, reason) {
+      const k = kindInfo[kind]
+      patch({ [kind]: 'lost' })
+      episodes.open(k.key, {
+        eventType: k.eventType,
+        metadata: { reason, ...(mediaError && { error: mediaError }) },
       })
-      if (!cancelled) stopFns.current.push(stopFace)
-
-      // 4. Object monitor (loads ONNX model in background).
-      const stopObj = await startObjectMonitor(videoRef?.current, {
-        onModelReady: () => setStatus(s => ({ ...s, objectModel: 'ready' })),
-        onModelError: (err) => {
-          console.warn('[useProctoring] object model unavailable:', err.message)
-          setStatus(s => ({ ...s, objectModel: 'unavailable' }))
-        },
-        onObjectDetected: ({ className, confidence }) => {
-          addAlert('phone_detected', `Prohibited object detected: ${className}.`, 'critical')
-          emit('phone_detected', 'critical', confidence, true, { className })
-        },
-      }).catch(err => {
-        console.warn('[useProctoring] objectMonitor failed to start:', err.message)
-        setStatus(s => ({ ...s, objectModel: 'unavailable' }))
-        return () => {}
-      })
-      if (!cancelled) stopFns.current.push(stopObj)
-
-      // 5. Audio monitor.
-      const stopAudio = startAudioMonitor(stream, {
-        onSpeechDetected: (type) => {
-          if (type === 'speech') {
-            addAlert('audio_detected', 'Sustained speech detected in your environment.', 'medium')
-            emit('audio_detected', 'medium', null, false, { audioType: 'speech' })
-          }
-          // 'noise' is logged silently without a visible alert.
-        },
-        onSilence: () => { /* no alert needed */ },
-        onMicInterrupted: () => {
-          setStatus(s => ({ ...s, micOk: false }))
-          addAlert('mic_lost', 'Microphone disconnected or muted.', 'high')
-          emit('audio_detected', 'high', null, false, { audioType: 'mic_interrupted' })
-        },
-        onMicRestored: () => {
-          setStatus(s => ({ ...s, micOk: true }))
-          dismissAlert('mic_lost')
-        },
-      })
-      if (!cancelled) stopFns.current.push(stopAudio)
-
-      // 6. Stream monitor (camera + mic track health).
-      const stopStream = startStreamMonitor(stream, {
-        onCameraLost: () => {
-          setStatus(s => ({ ...s, cameraOk: false }))
-          addAlert('camera_lost', 'Camera stream interrupted. Please check your webcam.', 'critical')
-          emit('face_not_detected', 'critical', null, false, { reason: 'camera_lost' })
-        },
-        onCameraRestored: () => {
-          setStatus(s => ({ ...s, cameraOk: true }))
-          dismissAlert('camera_lost')
-        },
-        onMicLost: () => {
-          setStatus(s => ({ ...s, micOk: false }))
-          addAlert('mic_lost', 'Microphone stream interrupted.', 'high')
-        },
-        onMicRestored: () => {
-          setStatus(s => ({ ...s, micOk: true }))
-          dismissAlert('mic_lost')
-        },
-      })
-      if (!cancelled) stopFns.current.push(stopStream)
-
-      // 7. Tab monitor.
-      const stopTab = startTabMonitor({
-        onTabHidden: (ts) => {
-          addAlert('tab_switch', 'You left the exam tab. This has been recorded.', 'high')
-          emit('tab_switch', 'high', null, false, { hiddenAt: ts })
-        },
-        onTabVisible: (durationMs) => {
-          dismissAlert('tab_switch')
-          if (durationMs > 2_000) {
-            // Log return-from-tab as metadata on a second event.
-            emit('tab_switch', 'medium', null, false, { returnedAfterMs: durationMs })
-          }
-        },
-        onWindowBlur: (ts) => {
-          // Window blur without tab hidden = alt-tab to another app.
-          addAlert('tab_switch', 'Exam window lost focus. This has been recorded.', 'medium')
-          emit('tab_switch', 'medium', null, false, { blurAt: ts })
-        },
-        onWindowFocus: () => {
-          dismissAlert('tab_switch')
-        },
-      })
-      if (!cancelled) stopFns.current.push(stopTab)
+      notify(k.key, `${k.label} ${REASON_TEXT[reason] ?? 'was interrupted'}. Monitoring needs it — please reconnect.`,
+        kind === 'camera' ? 'high' : 'medium',
+        { persist: true, action: { label: 'Reconnect', run: () => reconnectRef.current?.() } })
     }
 
-    start()
+    function onRestored(kind) {
+      const k = kindInfo[kind]
+      patch({ [kind]: 'ok' })
+      if (episodes.close(k.key) !== null) {
+        dismissAlert(k.key)
+        notify(`${k.key}-ok`, `${k.label} reconnected.`, 'low')
+      }
+    }
+
+    // ── 4. Audio ──
+    function startAudio(stream) {
+      return startAudioMonitor(stream, {
+        onStateChange: state => {
+          patch({ audio: state })
+          if (state === 'suspended') {
+            notify('audio-paused', 'Audio monitoring is paused by the browser. Click anywhere on the page to resume it.', 'low', { persist: true })
+          } else {
+            dismissAlert('audio-paused')
+          }
+        },
+        onSpeechStart: ({ confidence }) => {
+          if (episodes.open('speech', { eventType: 'speech_detected', confidence, metadata: { audio_class: 'speech' } })) {
+            notify('speech', 'Speech was detected near you. Please keep your exam environment quiet.', 'medium')
+          }
+        },
+        onSpeechEnd: () => episodes.close('speech'),
+        onNoiseStart: ({ peakDb, aboveFloorDb }) => {
+          if (episodes.open('noise', { eventType: 'unusual_noise', metadata: { audio_class: 'noise', peak_dbfs: peakDb, above_floor_db: aboveFloorDb } })) {
+            notify('noise', 'A loud noise was detected.', 'low')
+          }
+        },
+        onNoiseEnd: () => episodes.close('noise'),
+        onTiming: ms => latency.record('audio', ms),
+      })
+    }
+
+    function startStreamDependent(stream) {
+      streamStops.forEach(fn => fn())
+      streamStops = [
+        startStreamMonitor(stream, { onLost, onRestored }),
+        startAudio(stream),
+      ]
+      // A healthy new track ends any interruption carried over from before.
+      if (healthy(stream.getVideoTracks()[0])) onRestored('camera')
+      if (healthy(stream.getAudioTracks()[0])) onRestored('microphone')
+    }
+
+    async function acquire() {
+      try {
+        const s = await navigator.mediaDevices.getUserMedia({ video: true, audio: true })
+        mediaError = null
+        return s
+      } catch (err) {
+        mediaError = err.name
+        // Try each device on its own so one missing device doesn't cost both.
+        const parts = await Promise.all([
+          navigator.mediaDevices.getUserMedia({ video: true }).catch(() => null),
+          navigator.mediaDevices.getUserMedia({ audio: true }).catch(() => null),
+        ])
+        const tracks = parts.flatMap(p => p?.getTracks() ?? [])
+        return tracks.length ? new MediaStream(tracks) : null
+      }
+    }
+
+    function attach(stream) {
+      currentStream = stream
+      const v = video()
+      if (v && v.srcObject !== stream) v.srcObject = stream
+    }
+
+    reconnectRef.current = async () => {
+      const s = await acquire()
+      if (cancelled) { s?.getTracks().forEach(t => t.stop()); return }
+      if (!s) { notify('reconnect', 'Could not access the camera or microphone. Check your browser permissions.', 'high'); return }
+      if (ownedStream && ownedStream !== s) ownedStream.getTracks().forEach(t => t.stop())
+      ownedStream = s
+      attach(s)
+      startStreamDependent(s)
+    }
+
+    async function startMedia() {
+      let stream = existingStream
+      if (!stream || !stream.getTracks().some(t => t.readyState === 'live')) {
+        stream = await acquire()
+        if (cancelled) { stream?.getTracks().forEach(t => t.stop()); return }
+        ownedStream = stream
+      }
+      const empty = { getVideoTracks: () => [], getAudioTracks: () => [], getTracks: () => [] }
+      if (stream) attach(stream)
+      startStreamDependent(stream ?? empty)
+      if (!stream) {
+        patch({ face: 'unavailable', objects: 'unavailable', audio: 'unavailable' })
+        return
+      }
+
+      // ── 1 & 2. Face presence / multiple people ──
+      const people = { faces: false, persons: false }
+      function updatePeople(source, on, detail) {
+        people[source] = on
+        if (on) {
+          if (episodes.open('people', {
+            eventType: 'multiple_faces',
+            confidence: detail.confidence,
+            evidence: true,
+            metadata: { source, count: detail.count },
+          })) notify('people', 'More than one person appears to be in view. This has been recorded.', 'critical')
+        } else if (!people.faces && !people.persons) {
+          episodes.close('people')
+          dismissAlert('people')
+        }
+      }
+
+      stops.push(startFaceMonitor(video(), {
+        onReady: () => patch({ face: 'present' }),
+        onError: err => { console.warn('[useProctoring] face model unavailable:', err.message); patch({ face: 'unavailable' }) },
+        onFaceAbsent: ({ since }) => {
+          patch({ face: 'absent' })
+          // A dead camera explains the missing face; it is logged once, as such.
+          if (!healthy(currentStream?.getVideoTracks()[0])) return
+          episodes.open('face', { eventType: 'face_not_detected', occurredAt: since, evidence: true, metadata: { grace_ms: FACE_GRACE_MS } })
+          notify('face', "We can't see your face. Please make sure you are in front of the camera.", 'high', { persist: true })
+        },
+        onFacePresent: () => {
+          patch({ face: 'present' })
+          episodes.close('face')
+          dismissAlert('face')
+        },
+        onMultipleFaces: ({ count, confidence }) => updatePeople('faces', true, { count, confidence }),
+        onSingleFace:    () => updatePeople('faces', false),
+        onTiming:        ms => latency.record('face', ms),
+      }, { gracePeriodMs: FACE_GRACE_MS }))
+
+      // ── 3. Objects (+ person count as a second multi-person signal) ──
+      const personWindow = createHitWindow(3, 2)
+      stops.push(startObjectMonitor(video(), {
+        onReady: () => patch({ objects: 'active' }),
+        onError: err => { console.warn('[useProctoring] object model unavailable:', err.message); patch({ objects: 'unavailable' }) },
+        onObjectDetected: ({ classId, className, confidence, bbox }) => {
+          const isPhone = className === 'cell phone'
+          once({
+            eventType: isPhone ? 'phone_detected' : 'object_detected',
+            confidence,
+            evidence: true,
+            dedupeKey: `object:${classId}`,
+            metadata: { class_name: className, coco_class: classId, bbox: bbox && Object.fromEntries(Object.entries(bbox).map(([k, v]) => [k, Math.round(v)])) },
+          }).then(rec => {
+            if (rec) notify(`object-${classId}`, `A ${className} was detected in view. This has been recorded.`, isPhone ? 'critical' : 'high')
+          })
+        },
+        onPersons: ({ count, confidence }) => {
+          const edge = personWindow.update(count > 1)
+          if (edge === 'start') updatePeople('persons', true, { count, confidence })
+          if (edge === 'end')   updatePeople('persons', false)
+        },
+        onTiming: ms => latency.record('objects', ms),
+      }))
+    }
+
+    startMedia()
+
+    const flushId = setInterval(() => {
+      logger.flush().then(ok => { if (!cancelled) patch({ logging: ok ? 'ok' : 'retrying' }) }, () => {})
+    }, FLUSH_MS)
 
     return () => {
       cancelled = true
-      stopFns.current.forEach(fn => { try { fn?.() } catch {} })
-      stopFns.current = []
-      if (procSessionRef.current) {
-        endProctoringSession(procSessionRef.current).catch(() => {})
-        procSessionRef.current = null
-      }
-      // Don't stop the stream here — ExamRoom owns it.
+      clearInterval(flushId)
+      pendingTimers.forEach(clearTimeout)
+      pendingTimers.clear()
+      stops.forEach(fn => { try { fn() } catch { /* already stopped */ } })
+      streamStops.forEach(fn => { try { fn() } catch { /* already stopped */ } })
+      episodes.closeAll()
+      latency.stop()   // reports the last partial window
+      ready.then(() => logger.end()).catch(() => {})
+      ownedStream?.getTracks().forEach(t => t.stop())   // ExamRoom owns existingStream
+      reconnectRef.current = null
+      patch({ active: false })
     }
   }, [active, examSessionId]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  return { status, dismissAlert }
+  // ── Live status for the faculty dashboard (Phase 5) ───────
+  const heartbeatRef = useRef(null)
+
+  useEffect(() => {
+    if (!active || !examSessionId) return
+    const hb = createHeartbeat({
+      send: async fields => {
+        const { error } = await supabase.rpc('report_live_status', { p_exam_session_id: examSessionId, p_status: fields })
+        if (error) throw error
+      },
+      onError: err => console.warn('[useProctoring] heartbeat failed:', err.message),
+    })
+    heartbeatRef.current = hb
+    return () => { hb.stop(); heartbeatRef.current = null }
+  }, [active, examSessionId])
+
+  useEffect(() => {
+    if (status.active) heartbeatRef.current?.update(status)
+  }, [status])
+
+  const reconnect = useCallback(() => reconnectRef.current?.(), [])
+
+  return { status, dismissAlert, reconnect }
 }
