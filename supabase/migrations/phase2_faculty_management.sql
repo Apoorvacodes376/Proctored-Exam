@@ -200,6 +200,50 @@ create policy "Students view assigned exams"
 
 
 -- ============================================================
+-- 6b. SECURITY DEFINER helpers — break RLS circular references
+--
+-- Policies on questions and exam_assignments need to look up the
+-- faculty_id on exams, but exams itself has RLS enabled.  A plain
+-- subquery re-enters the exams RLS check, which in turn queries
+-- exam_assignments, causing infinite recursion.
+--
+-- The fix: wrap the cross-table lookups in SECURITY DEFINER
+-- functions that run as the table owner (bypassing RLS) and
+-- return only a boolean.  The functions are intentionally minimal
+-- and expose no data beyond the boolean result.
+-- ============================================================
+
+create or replace function public.exam_owned_by(p_exam_id uuid, p_faculty_id uuid)
+returns boolean
+language sql
+security definer
+stable
+set search_path = public
+as $$
+  select exists (
+    select 1 from public.exams
+    where  id = p_exam_id and faculty_id = p_faculty_id
+  );
+$$;
+
+create or replace function public.exam_assigned_to_email(p_exam_id uuid, p_email text)
+returns boolean
+language sql
+security definer
+stable
+set search_path = public
+as $$
+  select exists (
+    select 1
+    from   public.exam_assignments ea
+    join   public.students         s on s.id = ea.student_id
+    where  ea.exam_id = p_exam_id
+      and  s.email    = p_email
+  );
+$$;
+
+
+-- ============================================================
 -- 7. RLS — QUESTIONS
 -- ============================================================
 
@@ -208,34 +252,14 @@ alter table public.questions enable row level security;
 drop policy if exists "Faculty manage questions for own exams"     on public.questions;
 drop policy if exists "Students view questions for assigned exams" on public.questions;
 
--- Faculty: full CRUD on questions belonging to their exams.
 create policy "Faculty manage questions for own exams"
   on public.questions for all
-  using (
-    exists (
-      select 1 from public.exams
-      where  id = questions.exam_id and faculty_id = auth.uid()
-    )
-  )
-  with check (
-    exists (
-      select 1 from public.exams
-      where  id = questions.exam_id and faculty_id = auth.uid()
-    )
-  );
+  using     (public.exam_owned_by(exam_id, auth.uid()))
+  with check (public.exam_owned_by(exam_id, auth.uid()));
 
--- Students: read-only, only for questions in exams assigned to them.
 create policy "Students view questions for assigned exams"
   on public.questions for select
-  using (
-    exists (
-      select 1
-      from   public.exam_assignments ea
-      join   public.students         s on s.id = ea.student_id
-      where  ea.exam_id = questions.exam_id
-        and  s.email    = auth.email()
-    )
-  );
+  using (public.exam_assigned_to_email(exam_id, auth.email()));
 
 
 -- ============================================================
@@ -247,23 +271,13 @@ alter table public.exam_assignments enable row level security;
 drop policy if exists "Faculty manage assignments for own exams" on public.exam_assignments;
 drop policy if exists "Students view own assignments"            on public.exam_assignments;
 
--- Faculty: full CRUD on assignments for exams they own.
 create policy "Faculty manage assignments for own exams"
   on public.exam_assignments for all
-  using (
-    exists (
-      select 1 from public.exams
-      where  id = exam_assignments.exam_id and faculty_id = auth.uid()
-    )
-  )
-  with check (
-    exists (
-      select 1 from public.exams
-      where  id = exam_assignments.exam_id and faculty_id = auth.uid()
-    )
-  );
+  using     (public.exam_owned_by(exam_id, auth.uid()))
+  with check (public.exam_owned_by(exam_id, auth.uid()));
 
 -- Students: read-only, only their own assignment rows.
+-- Uses auth.email() (JWT) — no subquery against profiles.
 create policy "Students view own assignments"
   on public.exam_assignments for select
   using (
