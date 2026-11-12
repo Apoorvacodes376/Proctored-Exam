@@ -15,8 +15,8 @@ const GoogleIcon = () => (
 
 export default function Login() {
   const navigate = useNavigate()
-  const [form, setForm] = useState({ identifier: '', password: '' })
-  const [error, setError] = useState('')
+  const [form, setForm]     = useState({ identifier: '', password: '' })
+  const [error, setError]   = useState('')
   const [loading, setLoading] = useState(false)
 
   function handleChange(e) {
@@ -29,39 +29,63 @@ export default function Login() {
     setError('')
     setLoading(true)
 
-    let email = form.identifier
-    if (!form.identifier.includes('@')) {
-      const { data, error: lookupError } = await supabase
-        .from('profiles')
-        .select('email')
-        .eq('username', form.identifier)
-        .single()
-      if (lookupError || !data) {
+    const isEmail = form.identifier.includes('@')
+
+    if (isEmail) {
+      // ── Email login ──────────────────────────────────────────────────────
+      const { data, error: signInError } = await supabase.auth.signInWithPassword({
+        email: form.identifier,
+        password: form.password,
+      })
+      if (signInError) { setError(signInError.message); setLoading(false); return }
+      redirectByRole(data.user.id)
+    } else {
+      // ── Username login ───────────────────────────────────────────────────
+      // We cannot query profiles before authentication (RLS blocks anon reads).
+      // Strategy: sign in with a placeholder email first is not possible, so we
+      // require the user to provide their email when using username login, OR we
+      // use a Supabase Edge Function. The cleanest client-only solution is to
+      // show a helpful error and ask for email instead.
+      //
+      // However, we CAN do a two-step approach: attempt sign-in with a dummy
+      // email to get a 400, then... no. The correct approach is:
+      // After sign-in succeeds with email, the profile is readable. For username
+      // lookup we use a Postgres function with SECURITY DEFINER that is callable
+      // by anon — this avoids exposing the full profiles table.
+      //
+      // For now: look up via the RPC helper defined in the migration.
+      const { data: emailData, error: rpcError } = await supabase
+        .rpc('get_email_by_username', { p_username: form.identifier })
+
+      if (rpcError || !emailData) {
         setError('No account found with that username.')
         setLoading(false)
         return
       }
-      email = data.email
+
+      const { data, error: signInError } = await supabase.auth.signInWithPassword({
+        email: emailData,
+        password: form.password,
+      })
+      if (signInError) { setError(signInError.message); setLoading(false); return }
+      redirectByRole(data.user.id)
     }
+  }
 
-    const { data, error: signInError } = await supabase.auth.signInWithPassword({
-      email,
-      password: form.password,
-    })
-
-    if (signInError) {
-      setError(signInError.message)
-      setLoading(false)
-      return
+  async function redirectByRole(userId) {
+    // Retry up to 5 times — the handle_new_user trigger may race on first login.
+    let role = 'student'
+    for (let i = 0; i < 5; i++) {
+      const { data } = await supabase
+        .from('profiles')
+        .select('role')
+        .eq('id', userId)
+        .maybeSingle()
+      if (data?.role) { role = data.role; break }
+      if (i < 4) await new Promise(r => setTimeout(r, 600))
     }
-
-    const { data: profile } = await supabase
-      .from('profiles')
-      .select('role')
-      .eq('id', data.user.id)
-      .single()
-
-    navigate(profile?.role === 'faculty' ? '/faculty' : '/student', { replace: true })
+    setLoading(false)
+    navigate(role === 'faculty' ? '/faculty' : '/student', { replace: true })
   }
 
   async function handleGoogle() {
