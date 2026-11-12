@@ -9,4 +9,10 @@ export default defineConfig({
       '/api': 'http://localhost:8000',
     },
   },
+  test: {
+    environment: 'node',
+    include: ['src/**/*.test.{js,jsx}', 'tests/**/*.test.js'],
+    testTimeout: 60_000,
+    hookTimeout: 120_000,
+  },
 })

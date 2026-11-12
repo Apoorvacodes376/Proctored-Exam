@@ -2,6 +2,10 @@ import { useState } from 'react'
 import { Loader2, AlertCircle } from 'lucide-react'
 import { supabase } from '../../lib/supabase'
 
+// Exam times are entered in the faculty member's local time; the zone is
+// stored so the server can enforce the window (Phase 6).
+const BROWSER_TZ = Intl.DateTimeFormat().resolvedOptions().timeZone || null
+
 const EMPTY = {
   title: '', subject: '', exam_date: '', start_time: '',
   duration_mins: 60, total_marks: 100, instructions: '',
@@ -16,7 +20,8 @@ export default function ExamForm({ initial, facultyId, onSaved, onCancel }) {
     duration_mins: initial.duration_mins,
     total_marks: initial.total_marks,
     instructions: initial.instructions || '',
-  } : EMPTY)
+    time_zone: initial.time_zone || BROWSER_TZ,
+  } : { ...EMPTY, time_zone: BROWSER_TZ })
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
 
@@ -68,6 +73,11 @@ export default function ExamForm({ initial, facultyId, onSaved, onCancel }) {
         <div>
           <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Start Time</label>
           <input name="start_time" type="time" value={form.start_time} onChange={handleChange} required className={inputCls} />
+          {form.time_zone && (
+            <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
+              Time zone: {form.time_zone}. Students can start only inside this window.
+            </p>
+          )}
         </div>
         <div>
           <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Duration (minutes)</label>

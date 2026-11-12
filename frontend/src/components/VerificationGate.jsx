@@ -2,11 +2,11 @@ import { useEffect, useRef, useState, useCallback } from 'react'
 import * as faceapi from '@vladmandic/face-api'
 import { Camera, Loader2, CheckCircle2, XCircle, AlertTriangle, RefreshCw, Mic, MicOff, VideoOff } from 'lucide-react'
 
+import { MATCH_THRESHOLD, euclidean, classifyMatch } from '../identity/matching'
+
 const MODEL_URL = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model'
-// Euclidean distance threshold for FaceNet 128-d embeddings.
-// < 0.50 → same person (generous for lighting variation)
-// > 0.65 → different person
-const MATCH_THRESHOLD = 0.52
+// Distance thresholds for the 128-d face embeddings live in
+// identity/matching.js (uncalibrated defaults — see the Evaluation page).
 
 let modelsLoaded = false
 
@@ -28,18 +28,12 @@ async function getEmbedding(imageEl) {
   return detection?.descriptor ?? null
 }
 
-function euclidean(a, b) {
-  let sum = 0
-  for (let i = 0; i < a.length; i++) sum += (a[i] - b[i]) ** 2
-  return Math.sqrt(sum)
-}
-
 // ── States ──────────────────────────────────────────────────
 // idle → loading_models → requesting_media → ready
 // → capturing → verifying → passed | failed | manual_review
 // ────────────────────────────────────────────────────────────
 
-export default function VerificationGate({ referencePhotoUrl, onVerified, onManualReview }) {
+export default function VerificationGate({ referencePhotoUrl, onVerified, onManualReview, onAttempt }) {
   const videoRef = useRef(null)
   const streamRef = useRef(null)
   const [phase, setPhase] = useState('idle')
@@ -122,6 +116,7 @@ export default function VerificationGate({ referencePhotoUrl, onVerified, onManu
       const refEmbed = await getEmbedding(refImg)
       if (!refEmbed) {
         // Reference photo has no detectable face — allow manual review
+        onAttempt?.({ result: 'no_reference_face' })
         setPhase('manual_review')
         return
       }
@@ -129,19 +124,24 @@ export default function VerificationGate({ referencePhotoUrl, onVerified, onManu
       const dist = euclidean(liveEmbed, refEmbed)
       setDistance(dist)
 
-      if (dist <= MATCH_THRESHOLD) {
+      // Every attempt is recorded for faculty, separately from behavioural alerts.
+      const decision = classifyMatch(dist)
+      if (decision === 'passed') {
+        onAttempt?.({ result: 'passed', distance: dist, threshold: MATCH_THRESHOLD })
         setPhase('passed')
-      } else if (dist <= 0.70) {
+      } else if (decision === 'inconclusive') {
         // Borderline — offer manual review
+        onAttempt?.({ result: 'inconclusive', distance: dist, threshold: MATCH_THRESHOLD })
         setPhase('manual_review')
       } else {
+        onAttempt?.({ result: 'failed', distance: dist, threshold: MATCH_THRESHOLD })
         setPhase('failed')
       }
     } catch (err) {
       setError(err.message || 'Verification error.')
       setPhase('ready')
     }
-  }, [referencePhotoUrl])
+  }, [referencePhotoUrl, onAttempt])
 
   function retry() {
     setError('')
@@ -158,7 +158,7 @@ export default function VerificationGate({ referencePhotoUrl, onVerified, onManu
           <CheckCircle2 size={36} strokeWidth={1.5} className="text-green-600 dark:text-green-400" />
         </div>
         <p className="text-lg font-semibold text-gray-900 dark:text-white">Identity Verified</p>
-        <p className="text-sm text-gray-500 dark:text-gray-400">Match confidence: {((1 - distance) * 100).toFixed(1)}%</p>
+        <p className="text-sm text-gray-500 dark:text-gray-400">Face distance: {distance.toFixed(3)} (match ≤ {MATCH_THRESHOLD}; lower is more similar)</p>
         <button
           onClick={() => { streamRef.current?.getTracks().forEach(t => t.stop()); onVerified() }}
           className="mt-2 px-6 py-2.5 bg-green-600 hover:bg-green-700 text-white text-sm font-semibold rounded-xl transition-colors"

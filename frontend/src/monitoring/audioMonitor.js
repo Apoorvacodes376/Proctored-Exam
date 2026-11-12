@@ -2,135 +2,115 @@
  * audioMonitor.js
  * Module 4: Audio Monitoring
  *
- * Uses the Web Audio API (no external library needed).
+ * Browser adapter around vad.js: pulls ~43 ms time-domain frames from a
+ * Web Audio AnalyserNode every 100 ms and runs them through the voice
+ * activity detector, which distinguishes:
+ *   - speech          (voiced, harmonic, syllabically modulated sound)
+ *   - unusual noise   (loud, non-speech: bangs, ringtones, a vacuum)
+ *   - background      (steady noise the adaptive floor absorbs — not reported)
  *
- * Detects:
- *  - Microphone availability / interruption (track ended / muted)
- *  - Voice Activity Detection (VAD) via RMS energy threshold
- *  - Sustained speech vs. brief noise (speech requires energy above
- *    threshold for > SPEECH_SUSTAIN_MS continuously)
+ * Microphone availability / interruption is handled by streamMonitor.js,
+ * so a lost mic is reported once rather than by two modules.
  *
- * Browser limitation: Web Audio cannot distinguish whose voice is
- * speaking or identify specific words. It can only detect that audio
- * energy above a threshold is present. This is disclosed to the caller
- * via the callback label ('speech' vs 'noise').
+ * Browser limitations (see also vad.js):
+ *   - Browsers may apply noise suppression / auto-gain to the mic stream,
+ *     which changes levels; the detector adapts but thresholds are relative.
+ *   - An AudioContext may start "suspended" until the page has had a user
+ *     gesture. We try to resume and report the state via onStateChange.
  *
- * Fully independent — no React, no Supabase.
+ * No React, no Supabase.
  */
 
-const FFT_SIZE          = 256
-const NOISE_THRESH_RMS  = 0.015   // RMS amplitude 0–1; below = silence
-const SPEECH_THRESH_RMS = 0.04    // above = likely speech (not just ambient)
-const SPEECH_SUSTAIN_MS = 1_500   // must stay above speech threshold this long
-const POLL_INTERVAL_MS  = 200     // how often we sample RMS
+import { createVoiceActivityDetector } from './vad'
+
+const FFT_SIZE         = 2048
+const POLL_INTERVAL_MS = 100
 
 /**
- * Compute RMS of a Float32Array audio buffer.
- */
-function rms(buffer) {
-  let sum = 0
-  for (let i = 0; i < buffer.length; i++) sum += buffer[i] * buffer[i]
-  return Math.sqrt(sum / buffer.length)
-}
-
-/**
- * Start audio monitoring on a MediaStream.
- *
- * @param {MediaStream} stream  — must contain an audio track
+ * @param {MediaStream} stream — must contain an audio track
  * @param {object} callbacks
- * @param {function} callbacks.onSpeechDetected  (type: 'speech'|'noise') => void
- * @param {function} callbacks.onSilence         () => void
- * @param {function} callbacks.onMicInterrupted  () => void
- * @param {function} callbacks.onMicRestored     () => void
+ * @param {function} [callbacks.onSpeechStart]   ({ confidence, at }) => void
+ * @param {function} [callbacks.onSpeechEnd]     ({ durationMs, at }) => void
+ * @param {function} [callbacks.onNoiseStart]    ({ peakDb, aboveFloorDb, at }) => void
+ * @param {function} [callbacks.onNoiseEnd]      ({ durationMs, at }) => void
+ * @param {function} [callbacks.onStateChange]   ('running'|'suspended'|'unavailable', detail?) => void
+ * @param {object}   [options]
+ * @param {Function} [options.AudioContext]      injectable for tests
+ * @param {object}   [options.vad]               overrides for VAD_DEFAULTS
  * @returns {function} stop
  */
-export function startAudioMonitor(stream, { onSpeechDetected, onSilence, onMicInterrupted, onMicRestored }) {
-  const audioTrack = stream.getAudioTracks()[0]
-  if (!audioTrack) {
-    // No audio track — report immediately and return no-op.
-    onMicInterrupted?.()
+export function startAudioMonitor(stream, callbacks = {}, options = {}) {
+  const { onSpeechStart, onSpeechEnd, onNoiseStart, onNoiseEnd, onStateChange, onTiming } = callbacks
+
+  if (!stream?.getAudioTracks?.().length) {
+    onStateChange?.('unavailable', 'no audio track')
     return () => {}
   }
 
-  let stopped        = false
-  let micWasOk       = true
-  let speechStart    = null   // timestamp when energy first exceeded speech threshold
-  let speechAlerted  = false
-  let silenceAlerted = true   // start as "silent" so first speech fires correctly
-
-  // ── Track-level interruption detection ───────────────────
-  function handleTrackEnded() {
-    if (stopped) return
-    micWasOk = false
-    onMicInterrupted?.()
+  const Ctx = options.AudioContext ?? globalThis.AudioContext ?? globalThis.webkitAudioContext
+  if (!Ctx) {
+    onStateChange?.('unavailable', 'Web Audio not supported')
+    return () => {}
   }
 
-  audioTrack.addEventListener('ended', handleTrackEnded)
+  let audioCtx, source, pollId
+  let stopped = false
+  let lastState = null
 
-  // ── Web Audio VAD ─────────────────────────────────────────
-  let audioCtx, analyser, source, pollId
+  function reportState() {
+    const s = audioCtx?.state === 'running' ? 'running' : 'suspended'
+    if (s !== lastState) { lastState = s; onStateChange?.(s) }
+  }
+
+  // Autoplay policy can leave the context suspended; resume on the next
+  // interaction with the page.
+  function resumeOnGesture() {
+    if (audioCtx?.state === 'suspended') audioCtx.resume().then(reportState, () => {})
+  }
 
   try {
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)()
-    analyser = audioCtx.createAnalyser()
+    audioCtx = new Ctx()
+    const analyser = audioCtx.createAnalyser()
     analyser.fftSize = FFT_SIZE
-    source   = audioCtx.createMediaStreamSource(stream)
+    analyser.smoothingTimeConstant = 0
+    source = audioCtx.createMediaStreamSource(stream)
     source.connect(analyser)
 
-    const buffer = new Float32Array(analyser.fftSize)
+    const vad    = createVoiceActivityDetector({ sampleRate: audioCtx.sampleRate, ...options.vad })
+    const buffer = new Float32Array(FFT_SIZE)
+
+    const handlers = {
+      speech_start: onSpeechStart,
+      speech_end:   onSpeechEnd,
+      noise_start:  onNoiseStart,
+      noise_end:    onNoiseEnd,
+    }
 
     pollId = setInterval(() => {
       if (stopped) return
-
-      // Check track state each poll cycle.
-      const trackLive = audioTrack.readyState === 'live' && !audioTrack.muted
-      if (!trackLive && micWasOk) {
-        micWasOk = false
-        onMicInterrupted?.()
-      } else if (trackLive && !micWasOk) {
-        micWasOk = true
-        onMicRestored?.()
-      }
-
+      reportState()
+      if (audioCtx.state !== 'running') return
+      const t0 = performance.now()
       analyser.getFloatTimeDomainData(buffer)
-      const level = rms(buffer)
-
-      if (level < NOISE_THRESH_RMS) {
-        // Silence
-        speechStart   = null
-        speechAlerted = false
-        if (!silenceAlerted) {
-          silenceAlerted = true
-          onSilence?.()
-        }
-        return
-      }
-
-      silenceAlerted = false
-
-      if (level >= SPEECH_THRESH_RMS) {
-        if (!speechStart) speechStart = Date.now()
-        const sustained = Date.now() - speechStart
-
-        if (sustained >= SPEECH_SUSTAIN_MS && !speechAlerted) {
-          speechAlerted = true
-          onSpeechDetected?.('speech')
-        }
-      } else {
-        // Noise level (above silence, below speech)
-        speechStart   = null
-        speechAlerted = false
-        onSpeechDetected?.('noise')
-      }
+      const events = vad.process(buffer, Date.now())
+      onTiming?.(performance.now() - t0)   // FFT + VAD per window (ms)
+      for (const ev of events) handlers[ev.type]?.(ev)
     }, POLL_INTERVAL_MS)
+
+    if (audioCtx.state === 'suspended') audioCtx.resume?.().catch(() => {})
+    globalThis.addEventListener?.('pointerdown', resumeOnGesture)
+    globalThis.addEventListener?.('keydown', resumeOnGesture)
+    reportState()
   } catch (err) {
-    console.warn('[audioMonitor] Web Audio setup failed:', err.message)
+    onStateChange?.('unavailable', err.message)
+    return () => {}
   }
 
   return function stop() {
     stopped = true
     clearInterval(pollId)
-    audioTrack.removeEventListener('ended', handleTrackEnded)
-    try { source?.disconnect(); audioCtx?.close() } catch {}
+    globalThis.removeEventListener?.('pointerdown', resumeOnGesture)
+    globalThis.removeEventListener?.('keydown', resumeOnGesture)
+    try { source?.disconnect(); audioCtx?.close() } catch { /* already closed */ }
   }
 }
