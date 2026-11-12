@@ -15,22 +15,35 @@ export default function AuthCallback() {
       }
 
       const user = session.user
-      const { data: existing } = await supabase
-        .from('profiles')
-        .select('role')
-        .eq('id', user.id)
-        .single()
 
-      if (!existing) {
+      // Retry up to 5 times — the handle_new_user trigger may not have
+      // fired yet when the OAuth callback lands (trigger race).
+      let profile = null
+      for (let i = 0; i < 5; i++) {
+        const { data } = await supabase
+          .from('profiles')
+          .select('role')
+          .eq('id', user.id)
+          .maybeSingle()
+        if (data) { profile = data; break }
+        await new Promise(r => setTimeout(r, 600))
+      }
+
+      // If the trigger never fired (e.g. first OAuth login), insert the
+      // profile row directly. Role defaults to 'student' for OAuth users.
+      if (!profile) {
+        const username =
+          user.user_metadata?.full_name?.replace(/\s+/g, '').toLowerCase() ||
+          user.email.split('@')[0]
         await supabase.from('profiles').insert({
           id: user.id,
-          username: user.user_metadata?.full_name?.replace(/\s+/g, '').toLowerCase() || user.email.split('@')[0],
+          username,
           email: user.email,
           role: 'student',
         })
         navigate('/student', { replace: true })
       } else {
-        navigate(existing.role === 'faculty' ? '/faculty' : '/student', { replace: true })
+        navigate(profile.role === 'faculty' ? '/faculty' : '/student', { replace: true })
       }
     }
 

@@ -515,7 +515,15 @@ as $$
   select q.id, q.question_text, q.question_type, q.options, q.marks, q.order_index
   from   public.questions q
   where  q.exam_id = p_exam_id
-    and  public.is_assigned_to_exam(p_exam_id)
+    -- Inline assignment check: avoids dependency on is_assigned_to_exam()
+    -- which may not exist if phase2_patch_rls_recursion.sql was not run.
+    and  exists (
+           select 1
+           from   public.exam_assignments ea
+           join   public.students         s on s.id = ea.student_id
+           where  ea.exam_id = p_exam_id
+             and  s.email    = auth.email()
+         )
     and  (
            -- the student's own open session
            exists (select 1 from public.exam_sessions es join public.students s on s.id = es.student_id

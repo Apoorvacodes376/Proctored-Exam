@@ -15,8 +15,8 @@ const GoogleIcon = () => (
 
 export default function Signup() {
   const navigate = useNavigate()
-  const [form, setForm] = useState({ username: '', email: '', password: '', role: 'student' })
-  const [error, setError] = useState('')
+  const [form, setForm]       = useState({ username: '', email: '', password: '', role: 'student' })
+  const [error, setError]     = useState('')
   const [loading, setLoading] = useState(false)
   const [success, setSuccess] = useState(false)
 
@@ -30,14 +30,24 @@ export default function Signup() {
     setError('')
 
     if (form.username.trim().length < 3) return setError('Username must be at least 3 characters.')
-    if (form.password.length < 8) return setError('Password must be at least 8 characters.')
+    if (form.password.length < 8)        return setError('Password must be at least 8 characters.')
 
     setLoading(true)
+
+    // Pass username and role in user_metadata so the DB trigger can read them.
+    // The trigger (handle_new_user) creates the profiles row — we do NOT insert
+    // from the frontend because there is no INSERT policy for authenticated users
+    // (the trigger runs as SECURITY DEFINER and bypasses RLS).
     const { data, error: signUpError } = await supabase.auth.signUp({
       email: form.email,
       password: form.password,
       options: {
-        data: { username: form.username, role: form.role },
+        data: {
+          username: form.username.trim(),
+          // Role is stored in user_metadata by the trigger and used by RLS policies.
+          // The trigger validates it — only 'student' or 'faculty' are accepted.
+          role: form.role,
+        },
       },
     })
 
@@ -47,32 +57,15 @@ export default function Signup() {
       return
     }
 
-    if (data.user) {
-      await supabase.from('profiles').upsert({
-        id: data.user.id,
-        username: form.username,
-        role: 'student', // role escalation prevention; faculty promoted manually
-        email: form.email,
-      })
-    }
-
-    // Faculty: sign in immediately — no email verification required.
-    // Students: show the confirmation screen and wait for the email link.
-    if (form.role === 'faculty') {
-      const { data: signInData, error: signInError } = await supabase.auth.signInWithPassword({
-        email: form.email,
-        password: form.password,
-      })
+    // If Supabase email confirmation is disabled (common in dev), data.session
+    // is populated immediately. Redirect straight to the dashboard.
+    if (data.session) {
       setLoading(false)
-      if (signInError) {
-        // Account created but auto-login failed — fall back to login page.
-        navigate('/login', { state: { email: form.email } })
-        return
-      }
-      navigate(signInData.user ? '/faculty' : '/login', { replace: true })
+      navigate(form.role === 'faculty' ? '/faculty' : '/student', { replace: true })
       return
     }
 
+    // Email confirmation is enabled — show the "check your email" screen.
     setLoading(false)
     setSuccess(true)
   }
@@ -95,7 +88,9 @@ export default function Signup() {
           </div>
           <h2 className="text-2xl font-bold text-gray-900 dark:text-white mb-2">Check your email</h2>
           <p className="text-gray-500 dark:text-gray-400 mb-6">
-            We sent a confirmation link to <strong className="text-gray-700 dark:text-gray-300">{form.email}</strong>. Click it to activate your account.
+            We sent a confirmation link to{' '}
+            <strong className="text-gray-700 dark:text-gray-300">{form.email}</strong>.
+            Click it to activate your account.
           </p>
           <Link
             to="/login"
