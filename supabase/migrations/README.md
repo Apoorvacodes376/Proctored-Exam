@@ -16,6 +16,7 @@ supabase/
     ├── phase5_patch_monitoring_review.sql ← live status, transparent scoring, review decisions, realtime
     ├── phase6_research_evaluation.sql← audit log, metrics, feedback
     ├── phase6_patch_integrity_evaluation.sql ← exam-integrity/security fixes, research evaluation tables
+    ├── phase9_patch_liveness.sql      ← liveness fields on identity attempts
     ├── phase7_fix_auth_rls.sql       ← fix: HTTP 500/403 on profiles after login
     ├── phase8_patch_profile_roles.sql← fix: users could make themselves faculty
     └── README.md                     ← this file
@@ -45,7 +46,11 @@ Run the files **in phase order** in the Supabase SQL Editor
 | 6 | `phase6_research_evaluation.sql` | `audit_log`, `system_metrics`, `feedback`, `log_audit_event()`, `refresh_system_metrics()`, Phase 6 RLS |
 | 6a | `phase6_patch_integrity_evaluation.sql` | `exams.time_zone` + server-enforced exam window; guarded student writes to `exam_sessions` / `exam_answers`; grading on close, `finalize_expired_sessions()`; owner-only `update_descriptive_marks()` / `auto_grade_session()`; `get_exam_questions()` (no answer key for students); fixes to audit log, system metrics and feedback RLS; research tables `evaluation_trials`, `ground_truth_intervals`, `identity_ground_truth`, `monitoring_performance`, `model_evaluations`; `compute_risk_breakdown_ex()` / `risk_evaluation_data()`; no anonymous EXECUTE on security-definer functions |
 | 7 | `phase7_fix_auth_rls.sql` | **Fixes HTTP 500/403 on `/rest/v1/profiles`**: non-recursive profiles RLS using `app_metadata` JWT claim; `handle_new_user` writes role to both `app_metadata` and `user_metadata`; back-fills all existing users; fixes `exam_sessions` schema mismatch from `migration_fix_rls.sql`; `get_email_by_username()` RPC for username login |
+<<<<<<< ours
 | 8 | `phase8_patch_profile_roles.sql` | **Security fix for phase 7**: every signup is a student (the role is no longer read from `user_metadata`); `profiles` policies read the role from the table via `profile_role()` instead of an editable token claim; strips `role` from every `user_metadata`; schedules `finalize_expired_sessions()` every minute if `pg_cron` is already enabled |
+=======
+| 9 | `phase9_patch_liveness.sql` | `identity_verifications.liveness_result` / `liveness_challenge`, new result `liveness_failed` (idempotent; run after phase 6a) |
+>>>>>>> theirs
 
 **Never skip a phase.** Each phase references tables created by the previous
 one. Running them out of order will produce foreign-key or function-not-found

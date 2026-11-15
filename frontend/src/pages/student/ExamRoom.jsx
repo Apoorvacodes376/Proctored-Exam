@@ -195,11 +195,13 @@ export default function ExamRoom() {
   // ── Identity verification log (Phase 5) ─────────────────
   // Kept separate from behavioural proctoring events. Insert-only: students
   // cannot read these rows back.
-  const logIdentity = useCallback(async ({ result, distance = null, threshold = null }) => {
+  const logIdentity = useCallback(async ({ result, distance = null, threshold = null, liveness = null, livenessChallenge = null }) => {
     if (!exam?.id || !student?.id) return
     const round = x => (x === null || x === undefined ? null : Math.round(x * 10_000) / 10_000)
     const { error } = await supabase.from('identity_verifications').insert({
       exam_id: exam.id, student_id: student.id, result, distance: round(distance), threshold: round(threshold),
+      // Only sent when a liveness challenge was attempted (needs phase9_patch_liveness.sql).
+      ...(liveness ? { liveness_result: liveness, liveness_challenge: livenessChallenge } : {}),
     })
     if (error) console.warn('[ExamRoom] could not log identity verification:', error.message)
   }, [exam?.id, student?.id])
