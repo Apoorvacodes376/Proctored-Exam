@@ -3,6 +3,9 @@ import * as faceapi from '@vladmandic/face-api'
 import { Camera, Loader2, CheckCircle2, XCircle, AlertTriangle, RefreshCw, Mic, MicOff, VideoOff } from 'lucide-react'
 
 import { MATCH_THRESHOLD, euclidean, classifyMatch } from '../identity/matching'
+import {
+  LIVENESS_CONFIG, createChallenge, createLivenessSession, eyeAspectRatio, estimateYaw, worstDistance,
+} from '../identity/liveness'
 
 const MODEL_URL = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model'
 // Distance thresholds for the 128-d face embeddings live in
@@ -28,9 +31,29 @@ async function getEmbedding(imageEl) {
   return detection?.descriptor ?? null
 }
 
+/** One landmark sample from the live video, or null if no face is visible. */
+async function sampleLandmarks(videoEl) {
+  const det = await faceapi
+    .detectSingleFace(videoEl, new faceapi.SsdMobilenetv1Options({ minConfidence: 0.5 }))
+    .withFaceLandmarks()
+  if (!det) return null
+  const pts = det.landmarks.positions
+  return { ear: eyeAspectRatio(pts), yaw: estimateYaw(pts) }
+}
+
+/** Snapshot of the current video frame for embedding. */
+function frameCanvas(video) {
+  const canvas = document.createElement('canvas')
+  canvas.width = video.videoWidth
+  canvas.height = video.videoHeight
+  canvas.getContext('2d').drawImage(video, 0, 0)
+  return canvas
+}
+
 // ── States ──────────────────────────────────────────────────
 // idle → loading_models → requesting_media → ready
-// → capturing → verifying → passed | failed | manual_review
+// → capturing → liveness → verifying
+//   → passed | failed | manual_review | liveness_failed
 // ────────────────────────────────────────────────────────────
 
 export default function VerificationGate({ referencePhotoUrl, onVerified, onManualReview, onAttempt }) {
@@ -41,6 +64,9 @@ export default function VerificationGate({ referencePhotoUrl, onVerified, onManu
   const [distance, setDistance] = useState(null)
   const [micOk, setMicOk] = useState(null)
   const [camOk, setCamOk] = useState(null)
+  const [prompt, setPrompt] = useState('')
+  const [stepInfo, setStepInfo] = useState({ index: 0, total: 0 })
+  const cancelledRef = useRef(false)
 
   // Load models + start camera on mount
   useEffect(() => {
@@ -79,6 +105,7 @@ export default function VerificationGate({ referencePhotoUrl, onVerified, onManu
     init()
     return () => {
       cancelled = true
+      cancelledRef.current = true
       streamRef.current?.getTracks().forEach(t => t.stop())
     }
   }, [])
@@ -87,20 +114,47 @@ export default function VerificationGate({ referencePhotoUrl, onVerified, onManu
     setError('')
     setPhase('capturing')
 
-    // Draw current video frame to an offscreen canvas
     const video = videoRef.current
-    const canvas = document.createElement('canvas')
-    canvas.width = video.videoWidth
-    canvas.height = video.videoHeight
-    canvas.getContext('2d').drawImage(video, 0, 0)
-
-    setPhase('verifying')
 
     try {
-      // Get embedding from live capture
-      const liveEmbed = await getEmbedding(canvas)
-      if (!liveEmbed) {
+      // 1. Face before the challenge.
+      const beforeEmbed = await getEmbedding(frameCanvas(video))
+      if (!beforeEmbed) {
         setError('No face detected in the webcam image. Ensure your face is clearly visible and well-lit.')
+        setPhase('ready')
+        return
+      }
+
+      // 2. Liveness: a random sequence of actions a photo or a pre-recorded
+      //    clip cannot anticipate. Failing is an indicator, not a verdict.
+      const steps = createChallenge()
+      const session = createLivenessSession(steps)
+      const challenge = steps.join(',')
+      setStepInfo({ index: 0, total: steps.length })
+      setPhase('liveness')
+      let progress = session.update(null, performance.now())
+      setPrompt(progress.prompt)
+      while (progress.status === 'pending') {
+        if (cancelledRef.current) return
+        const sample = await sampleLandmarks(video)
+        progress = session.update(sample, performance.now())
+        setStepInfo({ index: Math.min(progress.index, steps.length), total: steps.length })
+        setPrompt(progress.prompt ?? '')
+        await new Promise(r => setTimeout(r, LIVENESS_CONFIG.sampleIntervalMs))
+      }
+      if (cancelledRef.current) return
+      if (progress.status === 'failed') {
+        onAttempt?.({ result: 'liveness_failed', liveness: 'failed', livenessChallenge: challenge })
+        setPhase('liveness_failed')
+        return
+      }
+
+      // 3. Face after the challenge; the larger distance is used so the
+      //    person cannot be swapped part-way through.
+      setPhase('verifying')
+      const afterEmbed = await getEmbedding(frameCanvas(video))
+      if (!afterEmbed) {
+        setError('Your face was not visible after the check. Please face the camera and try again.')
         setPhase('ready')
         return
       }
@@ -116,25 +170,26 @@ export default function VerificationGate({ referencePhotoUrl, onVerified, onManu
       const refEmbed = await getEmbedding(refImg)
       if (!refEmbed) {
         // Reference photo has no detectable face — allow manual review
-        onAttempt?.({ result: 'no_reference_face' })
+        onAttempt?.({ result: 'no_reference_face', liveness: 'passed', livenessChallenge: challenge })
         setPhase('manual_review')
         return
       }
 
-      const dist = euclidean(liveEmbed, refEmbed)
+      const dist = worstDistance(euclidean(beforeEmbed, refEmbed), euclidean(afterEmbed, refEmbed))
       setDistance(dist)
+      const lv = { liveness: 'passed', livenessChallenge: challenge }
 
       // Every attempt is recorded for faculty, separately from behavioural alerts.
       const decision = classifyMatch(dist)
       if (decision === 'passed') {
-        onAttempt?.({ result: 'passed', distance: dist, threshold: MATCH_THRESHOLD })
+        onAttempt?.({ result: 'passed', distance: dist, threshold: MATCH_THRESHOLD, ...lv })
         setPhase('passed')
       } else if (decision === 'inconclusive') {
         // Borderline — offer manual review
-        onAttempt?.({ result: 'inconclusive', distance: dist, threshold: MATCH_THRESHOLD })
+        onAttempt?.({ result: 'inconclusive', distance: dist, threshold: MATCH_THRESHOLD, ...lv })
         setPhase('manual_review')
       } else {
-        onAttempt?.({ result: 'failed', distance: dist, threshold: MATCH_THRESHOLD })
+        onAttempt?.({ result: 'failed', distance: dist, threshold: MATCH_THRESHOLD, ...lv })
         setPhase('failed')
       }
     } catch (err) {
@@ -178,6 +233,30 @@ export default function VerificationGate({ referencePhotoUrl, onVerified, onManu
         <p className="text-lg font-semibold text-gray-900 dark:text-white">Verification Failed</p>
         <p className="text-sm text-gray-500 dark:text-gray-400 text-center max-w-xs">
           Your face did not match the reference photograph. Ensure you are in good lighting and facing the camera directly.
+        </p>
+        <div className="flex gap-3 mt-2">
+          <button onClick={retry} className="flex items-center gap-2 px-4 py-2 text-sm font-medium border border-gray-300 dark:border-gray-700 rounded-xl text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors">
+            <RefreshCw size={14} strokeWidth={1.75} /> Try Again
+          </button>
+          <button onClick={() => { streamRef.current?.getTracks().forEach(t => t.stop()); onManualReview() }}
+            className="px-4 py-2 text-sm font-medium bg-amber-600 hover:bg-amber-700 text-white rounded-xl transition-colors">
+            Request Manual Review
+          </button>
+        </div>
+      </div>
+    )
+  }
+
+  if (phase === 'liveness_failed') {
+    return (
+      <div className="flex flex-col items-center gap-4 py-8">
+        <div className="w-16 h-16 rounded-full bg-amber-100 dark:bg-amber-900/30 flex items-center justify-center">
+          <AlertTriangle size={36} strokeWidth={1.5} className="text-amber-600 dark:text-amber-400" />
+        </div>
+        <p className="text-lg font-semibold text-gray-900 dark:text-white">Liveness Check Not Completed</p>
+        <p className="text-sm text-gray-500 dark:text-gray-400 text-center max-w-xs">
+          We could not see the requested actions. Face the camera in good lighting, keep your whole face in the frame
+          and try again. You can also request manual review by your faculty.
         </p>
         <div className="flex gap-3 mt-2">
           <button onClick={retry} className="flex items-center gap-2 px-4 py-2 text-sm font-medium border border-gray-300 dark:border-gray-700 rounded-xl text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors">
@@ -240,6 +319,12 @@ export default function VerificationGate({ referencePhotoUrl, onVerified, onManu
           playsInline
           className="w-full h-full object-cover"
         />
+        {phase === 'liveness' && (
+          <div className="absolute inset-x-0 bottom-0 bg-black/70 px-3 py-2 text-center">
+            <p className="text-white text-sm font-semibold">{prompt}</p>
+            <p className="text-white/70 text-xs">Step {Math.min(stepInfo.index + 1, stepInfo.total)} of {stepInfo.total}</p>
+          </div>
+        )}
         {(phase === 'loading_models' || phase === 'requesting_media' || phase === 'capturing' || phase === 'verifying') && (
           <div className="absolute inset-0 bg-black/60 flex flex-col items-center justify-center gap-2">
             <Loader2 size={28} strokeWidth={1.75} className="text-white animate-spin" />
@@ -261,7 +346,7 @@ export default function VerificationGate({ referencePhotoUrl, onVerified, onManu
       )}
 
       <p className="text-sm text-gray-500 dark:text-gray-400 text-center">
-        Position your face in the centre of the frame, ensure good lighting, then click Verify.
+        Position your face in the centre of the frame, ensure good lighting, then click Verify. You will be asked to blink or turn your head a few times to show you are present.
       </p>
 
       <button

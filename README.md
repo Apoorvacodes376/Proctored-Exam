@@ -130,6 +130,12 @@ Both `.env` files are git-ignored; only the `.env.example` files are committed.
    phase5_patch_monitoring_review.sql
    phase6_research_evaluation.sql
    phase6_patch_integrity_evaluation.sql
+
+   phase7_fix_auth_rls.sql
+   phase8_patch_profile_roles.sql
+
+   phase9_patch_liveness.sql
+
    ```
 
    Every file is idempotent. Do **not** run `supabase/schema.sql`. The
@@ -201,6 +207,17 @@ and set `VITE_YOLO_MODEL_URL=/models/yolov8n.onnx`.
 distance ≤ 0.52 passes, ≤ 0.70 goes to manual review, above that fails. These
 are uncalibrated defaults. Measure FAR/FRR for your setting on the
 Evaluation page before relying on them.
+
+**Liveness check** (`frontend/src/identity/liveness.js`, run before the face
+match; needs `phase9_patch_liveness.sql`): the student is asked for a random
+sequence of three actions (blink, turn head left, turn head right), detected
+from the 68 face landmarks (eye aspect ratio and nose position). The face is
+matched before and after the challenge and the larger distance is used.
+A failed challenge is logged as `liveness_failed` and offers retry or manual
+review; it is an indicator for faculty, not a verdict. Limits: thresholds are
+uncalibrated, a low frame rate can miss a blink, and real-time face
+puppeteering or deepfakes are not defended. Measure it (genuine users and
+photo/replay attempts) before claiming anything about it.
 
 **Optional learned risk model.** This is offline and experimental, and it is
 never used for live scoring:
