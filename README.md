@@ -130,12 +130,12 @@ Both `.env` files are git-ignored; only the `.env.example` files are committed.
    phase5_patch_monitoring_review.sql
    phase6_research_evaluation.sql
    phase6_patch_integrity_evaluation.sql
-<<<<<<< ours
+
    phase7_fix_auth_rls.sql
    phase8_patch_profile_roles.sql
-=======
+
    phase9_patch_liveness.sql
->>>>>>> theirs
+
    ```
 
    Every file is idempotent. Do **not** run `supabase/schema.sql`. The
