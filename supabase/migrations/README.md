@@ -17,6 +17,7 @@ supabase/
     ├── phase6_research_evaluation.sql← audit log, metrics, feedback
     ├── phase6_patch_integrity_evaluation.sql ← exam-integrity/security fixes, research evaluation tables
     ├── phase7_fix_auth_rls.sql       ← fix: HTTP 500/403 on profiles after login
+    ├── phase8_patch_profile_roles.sql← fix: users could make themselves faculty
     └── README.md                     ← this file
 ```
 
@@ -44,6 +45,7 @@ Run the files **in phase order** in the Supabase SQL Editor
 | 6 | `phase6_research_evaluation.sql` | `audit_log`, `system_metrics`, `feedback`, `log_audit_event()`, `refresh_system_metrics()`, Phase 6 RLS |
 | 6a | `phase6_patch_integrity_evaluation.sql` | `exams.time_zone` + server-enforced exam window; guarded student writes to `exam_sessions` / `exam_answers`; grading on close, `finalize_expired_sessions()`; owner-only `update_descriptive_marks()` / `auto_grade_session()`; `get_exam_questions()` (no answer key for students); fixes to audit log, system metrics and feedback RLS; research tables `evaluation_trials`, `ground_truth_intervals`, `identity_ground_truth`, `monitoring_performance`, `model_evaluations`; `compute_risk_breakdown_ex()` / `risk_evaluation_data()`; no anonymous EXECUTE on security-definer functions |
 | 7 | `phase7_fix_auth_rls.sql` | **Fixes HTTP 500/403 on `/rest/v1/profiles`**: non-recursive profiles RLS using `app_metadata` JWT claim; `handle_new_user` writes role to both `app_metadata` and `user_metadata`; back-fills all existing users; fixes `exam_sessions` schema mismatch from `migration_fix_rls.sql`; `get_email_by_username()` RPC for username login |
+| 8 | `phase8_patch_profile_roles.sql` | **Security fix for phase 7**: every signup is a student (the role is no longer read from `user_metadata`); `profiles` policies read the role from the table via `profile_role()` instead of an editable token claim; strips `role` from every `user_metadata`; schedules `finalize_expired_sessions()` every minute if `pg_cron` is already enabled |
 
 **Never skip a phase.** Each phase references tables created by the previous
 one. Running them out of order will produce foreign-key or function-not-found
@@ -140,32 +142,25 @@ These require a human decision and cannot be automated safely.
 
 ### Promoting a user to faculty
 
-The signup form allows users to self-select faculty. If you want to restrict
-faculty creation to admin-only, remove the faculty option from `Signup.jsx`
-and use the SQL path below.
+Every sign-up is a student; the signup form cannot choose a role and the
+database ignores any role sent by the client (`phase8_patch_profile_roles.sql`).
+Promote faculty with one of the options below, then ask the user to sign out
+and in again.
 
 **Option A — Supabase Dashboard**
 1. Go to **Table Editor → profiles**.
 2. Find the user's row and set `role = 'faculty'`.
-3. Go to **Authentication → Users**, find the user, edit their `app_metadata`
-   to add `{"role": "faculty"}`.
 
 **Option B — SQL (service-role only, never from the client)**
 ```sql
 update public.profiles
 set    role = 'faculty'
 where  email = 'faculty@university.edu';
-
-update auth.users
-set
-  raw_app_meta_data  = raw_app_meta_data  || '{"role":"faculty"}',
-  raw_user_meta_data = raw_user_meta_data || '{"role":"faculty"}'
-where email = 'faculty@university.edu';
 ```
 
-> After promotion the user must sign out and back in. The JWT carries the role
-> claim embedded at login time; the new claim only takes effect on the next
-> sign-in.
+> The role is read from `public.profiles`, not from the token, so it takes
+> effect as soon as the row changes. Ask the user to sign out and back in so
+> the app reloads their profile.
 
 ### Storage bucket visibility
 

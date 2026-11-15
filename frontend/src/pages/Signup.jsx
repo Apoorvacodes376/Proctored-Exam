@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
-import { User, Mail, Lock, GraduationCap, BookOpen, AlertCircle, Info, Loader2, MailCheck, ArrowLeft } from 'lucide-react'
+import { User, Mail, Lock, AlertCircle, Info, Loader2, MailCheck, ArrowLeft } from 'lucide-react'
 import { supabase } from '../lib/supabase'
 import ThemeToggle from '../components/ThemeToggle'
 
@@ -15,7 +15,7 @@ const GoogleIcon = () => (
 
 export default function Signup() {
   const navigate = useNavigate()
-  const [form, setForm]       = useState({ username: '', email: '', password: '', role: 'student' })
+  const [form, setForm]       = useState({ username: '', email: '', password: '' })
   const [error, setError]     = useState('')
   const [loading, setLoading] = useState(false)
   const [success, setSuccess] = useState(false)
@@ -34,19 +34,16 @@ export default function Signup() {
 
     setLoading(true)
 
-    // Pass username and role in user_metadata so the DB trigger can read them.
-    // The trigger (handle_new_user) creates the profiles row — we do NOT insert
-    // from the frontend because there is no INSERT policy for authenticated users
-    // (the trigger runs as SECURITY DEFINER and bypasses RLS).
+    // Pass the username in user_metadata so the DB trigger can read it.
+    // The trigger (handle_new_user) creates the profiles row. Every new account
+    // is a student: the role is never taken from the client. Faculty are
+    // promoted by an administrator (see README, "Promoting a user to faculty").
     const { data, error: signUpError } = await supabase.auth.signUp({
       email: form.email,
       password: form.password,
       options: {
         data: {
           username: form.username.trim(),
-          // Role is stored in user_metadata by the trigger and used by RLS policies.
-          // The trigger validates it — only 'student' or 'faculty' are accepted.
-          role: form.role,
         },
       },
     })
@@ -61,7 +58,7 @@ export default function Signup() {
     // is populated immediately. Redirect straight to the dashboard.
     if (data.session) {
       setLoading(false)
-      navigate(form.role === 'faculty' ? '/faculty' : '/student', { replace: true })
+      navigate('/student', { replace: true })
       return
     }
 
@@ -181,41 +178,9 @@ export default function Signup() {
               </div>
             </div>
 
-            {/* Role selection */}
-            <div>
-              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">I am a...</label>
-              <div className="grid grid-cols-2 gap-3">
-                <button
-                  type="button"
-                  onClick={() => setForm(f => ({ ...f, role: 'student' }))}
-                  className={`flex items-center justify-center gap-2 py-3 rounded-xl border-2 font-medium transition-colors ${
-                    form.role === 'student'
-                      ? 'border-green-500 bg-green-50 dark:bg-green-900/20 text-green-700 dark:text-green-400'
-                      : 'border-gray-200 dark:border-gray-700 text-gray-500 dark:text-gray-400 hover:border-gray-400'
-                  }`}
-                >
-                  <GraduationCap size={17} strokeWidth={1.75} />
-                  Student
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setForm(f => ({ ...f, role: 'faculty' }))}
-                  className={`flex items-center justify-center gap-2 py-3 rounded-xl border-2 font-medium transition-colors ${
-                    form.role === 'faculty'
-                      ? 'border-amber-500 bg-amber-50 dark:bg-amber-900/20 text-amber-700 dark:text-amber-400'
-                      : 'border-gray-200 dark:border-gray-700 text-gray-500 dark:text-gray-400 hover:border-gray-400'
-                  }`}
-                >
-                  <BookOpen size={17} strokeWidth={1.75} />
-                  Faculty
-                </button>
-              </div>
-              {form.role === 'faculty' && (
-                <div className="flex items-start gap-2 mt-2 text-xs text-amber-600 dark:text-amber-400">
-                  <Info size={13} strokeWidth={1.75} className="shrink-0 mt-0.5" />
-                  Faculty accounts are activated immediately — no email confirmation needed.
-                </div>
-              )}
+            <div className="flex items-start gap-2 text-xs text-gray-500 dark:text-gray-400">
+              <Info size={13} strokeWidth={1.75} className="shrink-0 mt-0.5" />
+              New accounts are student accounts. Faculty accounts are created by an administrator.
             </div>
 
             {error && (
